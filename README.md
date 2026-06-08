@@ -69,7 +69,7 @@ repositories {
 }
 
 dependencies {
-    implementation 'org.codeberg.thinking_tools:unimo-sdk-java:0.0.1'
+    implementation 'org.codeberg.thinking_tools:unimo-sdk-java:v0.0.1'
 }
 ```
 
@@ -86,7 +86,7 @@ dependencies {
 <dependency>
   <groupId>org.codeberg.thinking_tools</groupId>
   <artifactId>unimo-sdk-java</artifactId>
-  <version>0.0.1</version>
+  <version>v0.0.1</version>
 </dependency>
 ```
 
