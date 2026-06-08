@@ -1,0 +1,107 @@
+package com.unimo.sdk.client;
+
+import com.unimo.sdk.client.collections.CollectionController;
+import com.unimo.sdk.client.collections.KVContent;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+
+/**
+ * Minimal port of {@code sdk/ts/src_ts/client/Account.ts}: wraps a {@link VaultController} with a
+ * {@link Tasker}, {@link Billing}, and (when {@code keepAlive}) a live {@link Connection}, exposing
+ * the common surface so callers don't thread a Tasker through every call. The TS reactive
+ * task-list and network monitor are deferred.
+ */
+public final class Account {
+  private final String serviceUrl;
+  private final VaultController vault;
+  private final Tasker tasker;
+  private final Billing billing;
+  private final Connection connection; // null when keepAlive=false
+
+  public Account(String serviceUrl, VaultController vault, boolean keepAlive) {
+    this.serviceUrl = serviceUrl;
+    this.vault = vault;
+    this.tasker = new Tasker(serviceUrl);
+    this.billing = new Billing(serviceUrl, vault);
+    if (keepAlive) {
+      this.connection = new Connection(serviceUrl, vault);
+      this.connection.start();
+    } else {
+      this.connection = null;
+    }
+  }
+
+  public VaultController vault() {
+    return vault;
+  }
+
+  public Tasker tasker() {
+    return tasker;
+  }
+
+  public Billing billing() {
+    return billing;
+  }
+
+  /** Live WebSocket (or null when keepAlive=false). */
+  public Connection connection() {
+    return connection;
+  }
+
+  public boolean isManagerMember() {
+    return vault.isManagerMember();
+  }
+
+  public String getServiceUrl() {
+    return serviceUrl;
+  }
+
+  // ── storage ──
+  public CompletableFuture<Tasker.UploadResult> upload(String fileId, byte[] data, byte[] encKey, Integer expectedVersion) {
+    return tasker.upload(vault, fileId, data, encKey, expectedVersion);
+  }
+
+  public CompletableFuture<Tasker.DownloadResult> download(String fileId, byte[] encKey) {
+    return tasker.download(vault, fileId, encKey);
+  }
+
+  // ── collections ──
+  public List<CollectionController> listCollections() {
+    return vault.listCollections();
+  }
+
+  public CompletableFuture<KVContent> createNewCollection(String name, String type) {
+    return vault.createCollection(name, type, tasker);
+  }
+
+  public CompletableFuture<KVContent> getCollection(String name) {
+    return vault.getCollectionByName(tasker, name);
+  }
+
+  // ── members + invites ──
+  public CompletableFuture<Map<String, Object>> addMemberWithSeed(byte[] seed, String name, String role, String note) {
+    return vault.addMemberWithSeed(seed, name, role, note);
+  }
+
+  public CompletableFuture<Boolean> removeMember(String memberId) {
+    return vault.removeMember(memberId);
+  }
+
+  public CompletableFuture<VaultController.InviteCreated> createInvite(String role, Integer ttlSeconds) {
+    return vault.createInvite(role, ttlSeconds);
+  }
+
+  public CompletableFuture<Map<String, Object>> finalizeInvite(String inviteId) {
+    return vault.finalizeInvite(inviteId);
+  }
+
+  /** Subscribe to live {@code vault:event} frames (no-op when keepAlive=false). */
+  public ReactiveValue.Subscription onVaultEvent(Connection.Handler handler) {
+    return connection != null ? connection.on("vault:event", handler) : () -> {};
+  }
+
+  public void destroy() {
+    if (connection != null) connection.stop();
+  }
+}

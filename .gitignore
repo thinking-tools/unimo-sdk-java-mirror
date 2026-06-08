@@ -1,0 +1,11 @@
+# Build output
+out/
+build/
+.gradle/
+
+# Vendored jars for the no-Gradle javac path (fetched from Maven Central on demand)
+libs/*.jar
+
+# IDE
+*.iml
+.idea/

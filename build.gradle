@@ -1,0 +1,45 @@
+plugins {
+    id 'java-library'
+}
+
+group = 'com.unimo'
+version = '0.0.1'
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_1_8
+    targetCompatibility = JavaVersion.VERSION_1_8
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    // Post-quantum (ML-DSA-87, ML-KEM-1024) + cSHAKE256. No JCA provider is registered;
+    // the SDK uses BouncyCastle's low-level APIs to avoid clashing with Android's bundled
+    // com.android.org.bouncycastle. See README for why native JDK/Android PQC can't be used.
+    api 'org.bouncycastle:bcprov-jdk18on:1.81'
+
+    // HTTP + WebSocket (used from Phase 2 onward; the de-facto Android standard).
+    implementation 'com.squareup.okhttp3:okhttp:4.12.0'
+
+    testImplementation 'org.junit.jupiter:junit-jupiter:5.10.2'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+// The cross-language conformance checker lives in conformance/ and is shared between the
+// standalone runner (no-Gradle path) and the JUnit gate.
+sourceSets {
+    test {
+        java {
+            srcDir 'conformance'
+        }
+    }
+}
+
+test {
+    useJUnitPlatform()
+    testLogging {
+        events 'passed', 'failed', 'skipped'
+    }
+}
