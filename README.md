@@ -1,5 +1,7 @@
 # unimo-sdk-java
 
+[![Release](https://jitpack.io/v/org.codeberg.thinking_tools/unimo-sdk-java.svg)](https://jitpack.io/#org.codeberg.thinking_tools/unimo-sdk-java)
+
 Java/Android port of the TypeScript E2EE client SDK (`sdk/ts`). Post-quantum (ML-DSA-87 +
 ML-KEM-1024), cSHAKE256-derived identities, AES-256-GCM content encryption — wire-compatible
 with the gateway and the TS SDK.
@@ -52,6 +54,43 @@ src/main/java/com/unimo/sdk/
 └── client/   (Phase 2+)
 conformance/  ConformanceRunner + vectors.json (golden oracle from the TS SDK)
 ```
+
+## Install (JitPack)
+
+Published from this Codeberg repo via [JitPack](https://jitpack.io/#org.codeberg.thinking_tools/unimo-sdk-java).
+Add the JitPack repository, then the dependency — BouncyCastle and OkHttp come in transitively.
+
+**Gradle**
+
+```gradle
+repositories {
+    mavenCentral()
+    maven { url 'https://jitpack.io' }
+}
+
+dependencies {
+    implementation 'org.codeberg.thinking_tools:unimo-sdk-java:0.0.1'
+}
+```
+
+**Maven**
+
+```xml
+<repositories>
+  <repository>
+    <id>jitpack.io</id>
+    <url>https://jitpack.io</url>
+  </repository>
+</repositories>
+
+<dependency>
+  <groupId>org.codeberg.thinking_tools</groupId>
+  <artifactId>unimo-sdk-java</artifactId>
+  <version>0.0.1</version>
+</dependency>
+```
+
+Any pushed tag, `main-SNAPSHOT` (latest commit), or a commit hash works as the version.
 
 ## Build & test
 

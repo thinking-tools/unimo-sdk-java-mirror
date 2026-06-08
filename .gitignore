@@ -9,3 +9,4 @@ libs/*.jar
 # IDE
 *.iml
 .idea/
+CLAUDE.md

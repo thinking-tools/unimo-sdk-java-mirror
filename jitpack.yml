@@ -1,0 +1,4 @@
+# JitPack build config. Gradle 9 (pinned via the wrapper) requires JDK 17+ to run;
+# the library itself still targets Java 8 bytecode (see build.gradle).
+jdk:
+  - openjdk17
