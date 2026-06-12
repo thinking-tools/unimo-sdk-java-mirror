@@ -98,23 +98,32 @@ public final class Tasker {
   private UploadResult singleChunkUpload(
       VaultController v, String fileId, byte[] data, byte[] encKey, Integer expectedVersion) {
     byte[] ciphertext = AEAD.encrypt(encKey, data);
-    Integer expected = expectedVersion;
-    for (int attempt = 0; attempt < MAX_CAS_RETRIES; attempt++) {
-      ApiClient.ApiResponse r = commitHead(v, fileId, ciphertext, 0, expected);
-      if (r.status == 201) {
-        Map<String, Object> j = r.jsonObject();
-        return new UploadResult(((Number) j.get("version")).intValue(), (String) j.get("etag"), data.length, 0);
-      }
-      if (r.status == 412) {
-        Object cur = r.jsonObject().get("currentHead");
-        expected = cur instanceof Number ? ((Number) cur).intValue() : headProbe(v, fileId);
-        continue;
-      }
-      if (r.status == 401) throw new CodedException("Unauthorized", "UNAUTHORIZED");
-      if (r.status == 409) throw new CodedException("File is trashed", "TRASHED");
-      throw new CodedException("head PUT failed: " + r.status, "HEAD_PUT_FAILED");
+    ApiClient.ApiResponse r = commitHead(v, fileId, ciphertext, 0, expectedVersion);
+    if (r.status == 201) {
+      Map<String, Object> j = r.jsonObject();
+      return new UploadResult(((Number) j.get("version")).intValue(), (String) j.get("etag"), data.length, 0);
     }
-    throw new CodedException("CAS failed after retries", "CAS_FAILED");
+    if (r.status == 412) {
+      // 412 VERSION_MISMATCH: the remote head moved since the caller pinned expectedVersion (or
+      // expectedVersion=0 asserted first-write but an object already exists). Re-committing the
+      // same ciphertext over the new head would silently clobber the concurrent writer, so
+      // surface the conflict for the caller to pull + merge + retry (CollectionController.save
+      // branches on a "CAS"/"VERSION_MISMATCH" message). A commit with no expectedVersion can
+      // never 412 — the server skips CAS — so this only ever fires on a real pinned conflict.
+      Object cur;
+      try {
+        cur = r.jsonObject().get("currentHead");
+      } catch (RuntimeException e) {
+        cur = null;
+      }
+      throw new CodedException(
+          "CAS VERSION_MISMATCH: expected version " + expectedVersion + ", remote head "
+              + (cur instanceof Number ? cur : "unknown"),
+          "VERSION_MISMATCH");
+    }
+    if (r.status == 401) throw new CodedException("Unauthorized", "UNAUTHORIZED");
+    if (r.status == 409) throw new CodedException("File is trashed", "TRASHED");
+    throw new CodedException("head PUT failed: " + r.status, "HEAD_PUT_FAILED");
   }
 
   private UploadResult multiChunkUpload(

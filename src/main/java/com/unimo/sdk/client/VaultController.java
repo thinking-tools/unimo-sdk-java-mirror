@@ -212,7 +212,7 @@ public final class VaultController {
               long oldEpoch = ((Number) payload().get("keyEpoch")).longValue();
               @SuppressWarnings("unchecked")
               Map<String, Object> newPayload = (Map<String, Object>) result.vault.get("payload");
-              long newEpoch = ((Number) newPayload.get("keyEpoch")).longValue();
+              long newEpoch = rollbackCheckedEpoch(oldEpoch, newPayload);
               this.vaultManifest = result.vault;
               this.manifestVersion = result.version;
               if (newEpoch != oldEpoch) {
@@ -225,6 +225,30 @@ public final class VaultController {
                 mergeCollections(decryptCollectionsList()); // pick up collection-list changes at the same epoch
               }
             });
+  }
+
+  /**
+   * Rollback floor for a fetched manifest. {@code keyEpoch} only ever increases (rotation bumps it
+   * in {@link #rotateAndRewrapForMembers}), so a fetched manifest whose epoch is below the one held
+   * is a replayed/rolled-back manifest from the untrusted server — reject it rather than adopt
+   * (which would undo a member removal or re-derive down to retired keys). Fails closed when the
+   * fetched epoch is missing or non-integer.
+   *
+   * <p>In-session mitigation only: with no persisted floor, the first manifest of a session and any
+   * rollback across a restart remain undefended. Package-private for unit testing.
+   */
+  static long rollbackCheckedEpoch(long oldEpoch, Map<String, Object> newPayload) {
+    Object raw = newPayload == null ? null : newPayload.get("keyEpoch");
+    if (raw instanceof Double || raw instanceof Float || !(raw instanceof Number)) {
+      throw new CodedException("fetched manifest has a missing or non-integer keyEpoch", "INVALID_MANIFEST");
+    }
+    long newEpoch = ((Number) raw).longValue();
+    if (newEpoch < oldEpoch) {
+      throw new CodedException(
+          "manifest rollback rejected: fetched keyEpoch " + newEpoch + " < current " + oldEpoch,
+          "MANIFEST_ROLLBACK");
+    }
+    return newEpoch;
   }
 
   /** Reauth (POST /api/auth/reauth) with loop detection; updates {@code authToken} on success. */
