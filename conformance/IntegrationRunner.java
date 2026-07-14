@@ -5,10 +5,12 @@ import com.unimo.sdk.client.Account;
 import com.unimo.sdk.client.Billing;
 import com.unimo.sdk.client.Connection;
 import com.unimo.sdk.client.Members;
+import com.unimo.sdk.client.Search;
 import com.unimo.sdk.client.Tasker;
 import com.unimo.sdk.client.VaultController;
 import com.unimo.sdk.client.collections.CollectionController;
 import com.unimo.sdk.client.collections.KVContent;
+import com.unimo.sdk.crypto.CodedException;
 import com.unimo.sdk.crypto.CryptoUtils;
 import com.unimo.sdk.shared.Consts;
 import com.unimo.sdk.shared.Helpers;
@@ -161,6 +163,45 @@ public final class IntegrationRunner {
     await(tasker.upload(c3c, wsFileId, Helpers.utf8("ws-triggered blob"), encKey, 0));
     boolean gotEvent = eventLatch.await(15, TimeUnit.SECONDS);
     check("ws.receivedBlobPutEvent", gotEvent && "blob_put".equals(gotKind.get()));
+
+    // Phase 7: WebSocket search. suggest is provider-key-free (Google Suggest) — any failure
+    // there is a real regression, FAIL. Full search needs a Brave/Serper key, and the gateway
+    // strips error codes for the search domain (any engine throw → uncoded "Internal error" →
+    // WS_ERROR), so provider-missing is indistinguishable from a genuine gateway-side bug:
+    // with UNIMO_SEARCH_LIVE=1 (keyed/CI envs) any error FAILs; otherwise only WS_ERROR SKIPs
+    // loudly and SDK-side codes (WS_TIMEOUT/CONNECTION_CLOSED/BAD_FRAME/HANDLER_ERROR) still FAIL.
+    Search search = new Search(conn);
+    boolean emptyRejected = false;
+    try {
+      search.suggest("   ");
+    } catch (CodedException e) {
+      emptyRejected = "EMPTY_QUERY".equals(e.getCode());
+    }
+    check("search.emptyQueryRejectedLocally", emptyRejected);
+    boolean searchLive = "1".equals(System.getenv("UNIMO_SEARCH_LIVE"));
+    List<String> sugg = null;
+    try {
+      sugg = await(search.suggest("open source"));
+    } catch (CodedException e) {
+      System.out.println("  (suggest failed: " + e.getMessage() + " [" + e.getCode() + "])");
+    }
+    check("search.suggest.roundTrip", sugg != null);
+    // The gateway degrades suggest to [] when Google Suggest (unofficial endpoint) and the paid
+    // fallbacks are all unreachable — only a declared-live env can honestly demand content.
+    if (searchLive && sugg != null) check("search.suggest.nonEmpty", !sugg.isEmpty());
+    try {
+      AtomicReference<List<String>> early = new AtomicReference<>();
+      Search.Response res = await(search.search("post-quantum cryptography", early::set));
+      check("search.query.hasResults", res != null && !res.results.isEmpty() && res.results.get(0).url != null);
+      check("search.query.earlySuggestionsFrame", early.get() != null);
+    } catch (CodedException e) {
+      if (searchLive || !"WS_ERROR".equals(e.getCode())) {
+        check("search.roundTrip (" + e.getCode() + ")", false);
+      } else {
+        System.out.println("  SKIP search round-trip — no provider configured? set UNIMO_SEARCH_LIVE=1 to enforce: "
+            + e.getMessage() + " [" + e.getCode() + "]");
+      }
+    }
     conn.stop();
 
     // Phase 6b: minimal Account wrapper (reuses the existing vault — no extra login)

@@ -1,8 +1,12 @@
 package com.unimo.sdk.client;
 
+import com.unimo.sdk.crypto.CodedException;
 import com.unimo.sdk.shared.Json;
+import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -47,6 +51,7 @@ public final class Connection {
   private final String path;
   private final VaultController vault;
   private final Map<String, Set<Handler>> handlers = new ConcurrentHashMap<>();
+  private final Set<CompletableFuture<Map<String, Object>>> pending = ConcurrentHashMap.newKeySet();
 
   private volatile WebSocket ws;
   private volatile boolean connected;
@@ -77,6 +82,7 @@ public final class Connection {
       this.ws = null;
     }
     connected = false;
+    failPending("client stop");
   }
 
   /** Register a handler for a server message {@code type}; returns an unsubscribe handle. */
@@ -100,6 +106,102 @@ public final class Connection {
 
   public boolean isOpen() {
     return connected;
+  }
+
+  /**
+   * Starts an id-correlated request/response exchange (the gateway echoes the client-generated
+   * {@code id} on every reply frame). {@code msg} is sent with a fresh id; the returned builder's
+   * {@link WsRequest#send()} future completes with the first {@code terminalType} frame carrying
+   * that id. A gateway {@code error} frame rejects with a {@link CodedException} (the frame's
+   * {@code code}, or {@code WS_ERROR}); no reply within the timeout rejects with
+   * {@code WS_TIMEOUT}; a closed socket rejects immediately — and a socket close or failure
+   * mid-exchange rejects the in-flight future — with {@code CONNECTION_CLOSED}. An exception
+   * thrown by an {@link WsRequest#onFrame} handler rejects with {@code HANDLER_ERROR}, the
+   * throw as cause.
+   */
+  public WsRequest request(String terminalType, Map<String, Object> msg) {
+    return new WsRequest(terminalType, msg);
+  }
+
+  /** One request/response exchange over the socket — see {@link #request(String, Map)}. */
+  public final class WsRequest {
+    private final String terminalType;
+    private final Map<String, Object> msg;
+    private String intermediateType;
+    private Handler intermediateHandler;
+    private long timeoutMs = 20_000;
+
+    private WsRequest(String terminalType, Map<String, Object> msg) {
+      this.terminalType = terminalType;
+      this.msg = msg;
+    }
+
+    /** Also deliver non-terminal {@code type} frames carrying this request's id (e.g. the early
+     *  {@code search:suggestions} frame the gateway emits before {@code search:results}) — a
+     *  throw from {@code handler} rejects the {@link #send()} future with {@code HANDLER_ERROR}. */
+    public WsRequest onFrame(String type, Handler handler) {
+      this.intermediateType = type;
+      this.intermediateHandler = handler;
+      return this;
+    }
+
+    public WsRequest timeoutMs(long ms) {
+      this.timeoutMs = ms;
+      return this;
+    }
+
+    public CompletableFuture<Map<String, Object>> send() {
+      String id = UUID.randomUUID().toString();
+      CompletableFuture<Map<String, Object>> future = new CompletableFuture<>();
+      pending.add(future);
+
+      // Register before sending so a fast reply can't slip past the handlers.
+      ReactiveValue.Subscription terminal =
+          on(terminalType, m -> {
+            if (id.equals(m.get("id"))) future.complete(m);
+          });
+      ReactiveValue.Subscription error =
+          on("error", m -> {
+            if (!id.equals(m.get("id"))) return;
+            Object code = m.get("code");
+            future.completeExceptionally(
+                new CodedException(String.valueOf(m.get("error")), code != null ? String.valueOf(code) : "WS_ERROR"));
+          });
+      ReactiveValue.Subscription intermediate =
+          intermediateHandler == null
+              ? null
+              : on(intermediateType, m -> {
+                if (!id.equals(m.get("id"))) return;
+                try {
+                  intermediateHandler.onMessage(m);
+                } catch (RuntimeException e) {
+                  future.completeExceptionally(
+                      new CodedException("onFrame handler threw: " + e, "HANDLER_ERROR", e));
+                }
+              });
+      ScheduledFuture<?> timer =
+          SCHED.schedule(
+              () -> future.completeExceptionally(
+                  new CodedException("no " + terminalType + " within " + timeoutMs + "ms", "WS_TIMEOUT")),
+              timeoutMs,
+              TimeUnit.MILLISECONDS);
+
+      future.whenComplete(
+          (r, e) -> {
+            pending.remove(future);
+            timer.cancel(false);
+            terminal.close();
+            error.close();
+            if (intermediate != null) intermediate.close();
+          });
+
+      Map<String, Object> withId = new LinkedHashMap<>(msg);
+      withId.put("id", id);
+      if (!Connection.this.send(withId)) {
+        future.completeExceptionally(new CodedException("WebSocket not connected", "CONNECTION_CLOSED"));
+      }
+      return future;
+    }
   }
 
   private void open() {
@@ -133,7 +235,7 @@ public final class Connection {
       try {
         h.onMessage(msg);
       } catch (RuntimeException e) {
-        System.err.println("[Connection] handler error: " + e);
+        System.err.println("[Connection] handler error for " + type + " id=" + msg.get("id") + ": " + e);
       }
     }
   }
@@ -146,6 +248,14 @@ public final class Connection {
     double jitter = exp * 0.5 * ThreadLocalRandom.current().nextDouble();
     long delay = (long) Math.floor(exp - exp * 0.25 + jitter);
     reconnectTask = SCHED.schedule(this::open, delay, TimeUnit.MILLISECONDS);
+  }
+
+  /** Rejects all in-flight request futures: the gateway replies on the connection a request
+   *  arrived on, so once that socket is gone no reply is coming. Completed futures no-op. */
+  private void failPending(String message) {
+    for (CompletableFuture<Map<String, Object>> f : pending) {
+      f.completeExceptionally(new CodedException(message, "CONNECTION_CLOSED"));
+    }
   }
 
   private final class Listener extends WebSocketListener {
@@ -172,6 +282,9 @@ public final class Connection {
     public void onClosed(WebSocket webSocket, int code, String reason) {
       connected = false;
       Connection.this.ws = null;
+      // After connected=false: a send() racing this close either sees the flag (fails fast) or
+      // its already-registered future is failed here — no request can slip through unrejected.
+      failPending("WebSocket closed: " + code + " " + reason);
       if (stopped) return;
       if (code == 1008) {
         // gateway auth-failure code — try a token refresh before reconnecting.
@@ -191,6 +304,7 @@ public final class Connection {
     public void onFailure(WebSocket webSocket, Throwable t, Response response) {
       connected = false;
       Connection.this.ws = null;
+      failPending("WebSocket failure: " + t);
       if (!stopped) scheduleReconnect();
     }
   }

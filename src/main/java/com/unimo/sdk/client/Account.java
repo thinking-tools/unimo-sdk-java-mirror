@@ -18,6 +18,7 @@ public final class Account {
   private final Tasker tasker;
   private final Billing billing;
   private final Connection connection; // null when keepAlive=false
+  private final Search search; // null when keepAlive=false
 
   public Account(String serviceUrl, VaultController vault, boolean keepAlive) {
     this.serviceUrl = serviceUrl;
@@ -27,8 +28,10 @@ public final class Account {
     if (keepAlive) {
       this.connection = new Connection(serviceUrl, vault);
       this.connection.start();
+      this.search = new Search(this.connection);
     } else {
       this.connection = null;
+      this.search = null;
     }
   }
 
@@ -47,6 +50,11 @@ public final class Account {
   /** Live WebSocket (or null when keepAlive=false). */
   public Connection connection() {
     return connection;
+  }
+
+  /** WebSocket search over the live connection (or null when keepAlive=false). */
+  public Search search() {
+    return search;
   }
 
   public boolean isManagerMember() {

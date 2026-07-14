@@ -18,10 +18,11 @@ with the gateway and the TS SDK.
 | 5 | Collections/KV + `ReactiveValue` observable (dependency-free) | ✅ done — **live-verified** (create/persist/reload + survives key rotation) |
 | 6a | Billing + Invites (manager-area read/write) | ✅ done — **live-verified** (create→claim→finalize→login; billing catalog/state) |
 | 6b | WebSocket `Connection` (`vault:event` push) + minimal `Account` | ✅ done — **live-verified** (real blob_put push received; Account upload/download) |
+| 7 | WebSocket `Search` (typing suggestions + full web search) + `Connection` request/response | ✅ done — **live-verified** (suggest round-trip + error-frame path; full results need gateway search providers) |
 
-**Feature-complete** vs the TypeScript SDK (the only TS gaps are also stubs there: `VFS`/`LIST`/`CRDTLIST` collection types, and the Tasker reactive task-queue/progress UI convenience).
+**Feature-complete** vs the TypeScript SDK (the only TS gaps are also stubs there: `VFS`/`LIST`/`CRDTLIST` collection types, and the Tasker reactive task-queue/progress UI convenience). `Search` is a **Java-first** addition — the TS SDK has no search client yet; it speaks the gateway's WS `search` domain directly.
 
-Live coverage: **31/31** in `IntegrationRunner` (register/login/unlock · member add/remove + key rotation · reauth · single + multi-chunk encrypted storage + CAS · KV collection create/reload/rotate · billing catalog/state · full invite create→claim→finalize→login · WebSocket `vault:event` push · Account wrapper). Offline cross-language conformance: **45/45**.
+Live coverage: **33/33** in `IntegrationRunner` (register/login/unlock · member add/remove + key rotation · reauth · single + multi-chunk encrypted storage + CAS · KV collection create/reload/rotate · billing catalog/state · full invite create→claim→finalize→login · WebSocket `vault:event` push · search suggest round-trip · Account wrapper; the full search-results checks self-skip loudly when the gateway lacks working search providers; set `UNIMO_SEARCH_LIVE=1` to FAIL instead). Offline cross-language conformance: **45/45**.
 
 **UI binding:** `ReactiveValue<T>` is a neutral, dependency-free observable (`get`/`set`/`update`/`subscribe`/`onChange`). Adapt at the UI edge — `MutableLiveData` (`rv.subscribe(ld::postValue)`) for Views/Java, or `MutableStateFlow` (`rv.subscribe { flow.value = it }`, read via `collectAsState()`) for Compose. The core stays Android-free and pure-JVM-testable.
 
@@ -91,6 +92,32 @@ dependencies {
 ```
 
 Any pushed tag, `main-SNAPSHOT` (latest commit), or a commit hash works as the version.
+
+## Web search
+
+Search rides the same authenticated WebSocket as `vault:event` push (there is no HTTP search
+route). `search:typing` → suggestions (free); `search:query` → full results (counted against
+the vault's search quota).
+
+```java
+Account account = new Account(serviceUrl, vault, true); // keepAlive=true opens the WS
+Search search = account.search();
+
+List<String> suggestions = search.suggest("post-quantum").get();
+
+Search.Response res = search.search("post-quantum cryptography",
+    early -> System.out.println("suggestions: " + early)).get();
+for (Search.Result r : res.results) {
+  System.out.println(r.title + " — " + r.url);
+}
+```
+
+Failures reject the future with a `CodedException`: the gateway's error code (or `WS_ERROR`)
+for server-side errors, `WS_TIMEOUT` after 20s without a reply, `CONNECTION_CLOSED` when the
+socket is down or drops mid-request, `BAD_FRAME` when a `search:results` reply is malformed
+(missing `data`), `EMPTY_QUERY` (thrown synchronously) for blank queries.
+A throwing `onSuggestions` callback rejects the future with a `HANDLER_ERROR` `CodedException`
+wrapping it — keep the early-frame handler cheap and non-throwing.
 
 ## Build & test
 
