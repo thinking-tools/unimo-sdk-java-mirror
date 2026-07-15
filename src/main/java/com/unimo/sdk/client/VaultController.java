@@ -13,6 +13,7 @@ import com.unimo.sdk.shared.Json;
 import com.unimo.sdk.shared.Validators;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -28,7 +29,7 @@ public final class VaultController {
   private final MemberInfoBasics activeMember;
   private Map<String, Object> vaultManifest;
   private String etag;
-  private String authToken;
+  private volatile String authToken;
   private int manifestVersion;
 
   private byte[] aeadVaultKey;
@@ -36,8 +37,10 @@ public final class VaultController {
   private byte[] managersKey;
   private byte[] collectionsKey;
   private List<Map<String, Object>> memberList;
-  private int reauthAttempts = 0;
-  private long lastReauthTime = 0;
+  /** Serializes {@link #reauth()} dispatch so concurrent 401s share one POST and one token. */
+  private final Object reauthLock = new Object();
+  /** Non-null while a reauth is in flight; {@link #reauth()} joins it instead of re-dispatching. */
+  private CompletableFuture<ReauthOutcome> inFlightReauth;
 
   /** Observable list of this vault's collections (decrypted from the manifest at unlock). */
   public final ReactiveValue<List<CollectionController>> collections = new ReactiveValue<>(new ArrayList<>());
@@ -251,16 +254,78 @@ public final class VaultController {
     return newEpoch;
   }
 
-  /** Reauth (POST /api/auth/reauth) with loop detection; updates {@code authToken} on success. */
-  public CompletableFuture<Boolean> handleAuthError() {
-    long nowTime = System.currentTimeMillis();
-    if (nowTime - lastReauthTime < 5000) {
-      reauthAttempts++;
-      if (reauthAttempts > 3) return CompletableFuture.completedFuture(false);
-    } else {
-      reauthAttempts = 1;
+  /** Outcome of a reauth attempt, classifying the gateway response by retryability. */
+  enum ReauthOutcome {
+    /** 2xx with a fresh authToken — reconnect/retry with it. */
+    REFRESHED,
+    /** 404/401/403, or a 2xx with no usable token — genuine rejection; halting the chain is correct. */
+    REJECTED,
+    /** 400 catch-all / 409 replay / 429 / 5xx / transport failure — momentary; retry on backoff. */
+    TRANSIENT
+  }
+
+  /**
+   * Pure classification of a {@code POST /api/auth/reauth} response (route in
+   * {@code secure.gateway.unimo/src/users/routes.ts}). Package-private + static so the
+   * retryability rules are unit-testable in isolation, mirroring {@link #rollbackCheckedEpoch}.
+   * {@code body} is the parsed JSON for a 2xx, else null (non-2xx outcomes are status-driven).
+   */
+  static ReauthOutcome classifyReauth(int status, Map<String, Object> body) {
+    if (status >= 200 && status < 300) {
+      // TS does `if (response.ok && response.authToken)` — JS truthiness, so "" is rejected. Match
+      // that with a non-empty String, and require String so the (String) cast in doReauth can't throw
+      // (a non-String would otherwise ClassCastException into a swallowed TRANSIENT = infinite retry).
+      if (body != null && Boolean.TRUE.equals(body.get("ok"))) {
+        Object tok = body.get("authToken");
+        if (tok instanceof String && !((String) tok).isEmpty()) return ReauthOutcome.REFRESHED;
+      }
+      // 2xx without a usable non-empty String authToken: gateway/version skew — treat as not-refreshed.
+      return ReauthOutcome.REJECTED;
     }
-    lastReauthTime = nowTime;
+    // 404 account gone, 401 bad signature/revoked, 403 member removed: definitive, don't spin.
+    if (status == 404 || status == 401 || status == 403) return ReauthOutcome.REJECTED;
+    // 400 (catch-all incl. infra), 409 (replay — a duplicated POST can trip this), 429, 5xx: retry.
+    return ReauthOutcome.TRANSIENT;
+  }
+
+  /**
+   * Single-flight reauth: concurrent callers (a Connection upgrade-401, {@link #invokeAuthed}'s
+   * 401, {@link #fetchLatestManifest}'s 401) share one {@code POST /api/auth/reauth} and adopt one
+   * refreshed token, instead of racing N signed reauths whose token regenerations invalidate each
+   * other. The per-vault gateway rate limit (429) and this single-flight together replace the old
+   * 3-in-5s client-side throttle, which folded transient failures into a permanent halt.
+   */
+  CompletableFuture<ReauthOutcome> reauth() {
+    synchronized (reauthLock) {
+      if (inFlightReauth != null) return inFlightReauth;
+      CompletableFuture<ReauthOutcome> f = doReauth();
+      inFlightReauth = f;
+      f.whenComplete(
+          (r, e) -> {
+            synchronized (reauthLock) {
+              if (inFlightReauth == f) inFlightReauth = null;
+            }
+          });
+      return f;
+    }
+  }
+
+  /**
+   * Guards {@link #dispatchReauth()} so a synchronous throw (from the sign/sha256/getId preamble,
+   * or send()'s sync portion) never escapes: doReauth always returns a normally-completing future,
+   * so reauth() — and Connection's .whenComplete — always attach. A sync throw otherwise leaves
+   * reauth() with no future and stalls the WebSocket reconnect silently.
+   */
+  private CompletableFuture<ReauthOutcome> doReauth() {
+    try {
+      return dispatchReauth();
+    } catch (RuntimeException ignored) {
+      return CompletableFuture.completedFuture(ReauthOutcome.TRANSIENT);
+    }
+  }
+
+  private CompletableFuture<ReauthOutcome> dispatchReauth() {
+    long nowTime = System.currentTimeMillis();
     Map<String, Object> payload =
         Json.obj(
             "memberId", activeMember.memberId,
@@ -273,16 +338,35 @@ public final class VaultController {
             "payload", payload,
             "payloadHash", Helpers.base64(hash),
             "signature", Helpers.base64(CryptoPQ.sign(activeMember.dsaKeys.secretKey, hash)));
-    return ApiClient.makeRequest("POST", serviceUrl + "/api/auth/reauth", body)
-        .thenApply(
+    // send() (not makeRequest) so the HTTP status survives for classification.
+    return ApiClient.send("POST", serviceUrl + "/api/auth/reauth", Helpers.utf8(Json.canonical(body)), Collections.emptyMap())
+        .<ReauthOutcome>thenApply(
             resp -> {
-              if (Boolean.TRUE.equals(resp.get("ok")) && resp.get("authToken") != null) {
-                this.authToken = (String) resp.get("authToken");
-                return true;
+              Map<String, Object> parsed;
+              try {
+                parsed = resp.ok() ? resp.jsonObject() : null;
+              } catch (RuntimeException parseError) {
+                // 2xx with an unparseable body is a gateway/version bug — retry, don't halt.
+                return ReauthOutcome.TRANSIENT;
               }
-              return false;
+              ReauthOutcome outcome = classifyReauth(resp.status, parsed);
+              if (outcome == ReauthOutcome.REFRESHED) {
+                // Safe: classifyReauth returns REFRESHED only when authToken is a non-empty String.
+                this.authToken = (String) parsed.get("authToken");
+              }
+              return outcome;
             })
-        .exceptionally(e -> false);
+        .exceptionally(e -> ReauthOutcome.TRANSIENT);
+  }
+
+  /**
+   * Boolean view of {@link #reauth()} for the two HTTP callers ({@link #fetchLatestManifest},
+   * {@link #invokeAuthed}) that only need "did the token refresh, should I retry once". This is the
+   * public surface; {@link #reauth()} is package-private and exposes the full tri-state to in-package
+   * callers (e.g. {@link Connection}).
+   */
+  public CompletableFuture<Boolean> handleAuthError() {
+    return reauth().thenApply(o -> o == ReauthOutcome.REFRESHED);
   }
 
   // ── members (add / remove → key rotation + signed manifest PUT) ──
