@@ -10,7 +10,9 @@ import java.util.concurrent.CompletableFuture;
  * Minimal port of {@code sdk/ts/src_ts/client/Account.ts}: wraps a {@link VaultController} with a
  * {@link Tasker}, {@link Billing}, and (when {@code keepAlive}) a live {@link Connection}, exposing
  * the common surface so callers don't thread a Tasker through every call. The TS reactive
- * task-list and network monitor are deferred.
+ * task-list is deferred. Network awareness is the app's job: wire OS connectivity events into
+ * {@link Connection#networkLost()} / {@link Connection#networkAvailable()} via {@link
+ * #connection()} — see the README; that wiring is what recovers a dropped socket.
  */
 public final class Account {
   private final String serviceUrl;

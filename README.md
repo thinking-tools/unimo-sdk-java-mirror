@@ -119,6 +119,35 @@ socket is down or drops mid-request, `BAD_FRAME` when a `search:results` reply i
 A throwing `onSuggestions` callback rejects the future with a `HANDLER_ERROR` `CodedException`
 wrapping it — keep the early-frame handler cheap and non-throwing.
 
+## Connection recovery (Android wiring — required)
+
+The SDK sends **no pings and runs no reconnect timers**: keepalive is the gateway's job (the
+server pings; OkHttp answers pongs natively, zero code), and recovery is event-driven. Feed OS
+connectivity events into the connection — without this wiring a dropped connection stays down,
+because OkHttp cannot detect a silent network loss on its own:
+
+```java
+ConnectivityManager cm =
+    (ConnectivityManager) context.getSystemService(Context.CONNECTIVITY_SERVICE);
+Connection conn = account.connection();
+cm.registerDefaultNetworkCallback(new ConnectivityManager.NetworkCallback() {
+  @Override public void onAvailable(Network network) { conn.networkAvailable(); }
+  @Override public void onCapabilitiesChanged(Network network, NetworkCapabilities caps) {
+    // onAvailable can fire before the network is validated (DNS not yet working) — this
+    // second trigger retries once validation lands. networkAvailable() is idempotent.
+    if (caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)) conn.networkAvailable();
+  }
+  @Override public void onLost(Network network) { conn.networkLost(); }
+});
+```
+
+Requires `ACCESS_NETWORK_STATE`. Also call `conn.networkAvailable()` from `onResume()` — it
+covers drops that happen with no network change (e.g. a gateway restart while the app sits in
+the background). `networkLost()` kills the transport at once instead of waiting minutes for TCP
+timeouts; `networkAvailable()` reconnects immediately, or cancels a half-dead attempt and
+retries once. Auth-expiry recovery (401 upgrade rejection / `1008` close → reauth → reopen)
+stays automatic and needs no wiring.
+
 ## Build & test
 
 ```bash
