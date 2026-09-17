@@ -11,6 +11,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import okhttp3.OkHttpClient;
 import okhttp3.Request;
@@ -24,19 +25,20 @@ import okhttp3.WebSocketListener;
  * head change / presence / member revoked / invite claimed / subscription changed). Credentials
  * ride the URL query (the upgrade can't set headers): {@code wss://host/api/ws?token=&vid=&mid=}.
  *
- * <p>Recovery is event-driven — no reconnect timers, no client pings (a deliberate divergence
- * from the TS original; keepalive is the gateway's job via server pings). The app feeds OS
- * connectivity events into {@link #networkLost()} (kill the transport now instead of waiting for
- * TCP timeouts) and {@link #networkAvailable()} (reconnect now); without that wiring a dropped
- * connection stays down, because OkHttp cannot detect a silent network loss without pings. Each
- * connect attempt is bounded by a call timeout (covers DNS, which {@code connectTimeout} does
- * not), so a hung attempt can never pin the connection. Auth failures still recover on their
- * own: the gateway rejects an expired-token upgrade with HTTP 401 (delivered to {@link
- * Listener#onFailure}) or a {@code 1008} wiring-fault close; both trigger a single-flight reauth
- * via {@link VaultController#reauth()}. On success the connection reopens with the fresh token
+ * <p>Recovery is layered. A dropped or dead connection retries on exponential backoff (250ms →
+ * 30s cap, with jitter — matching the TS original), and client pings make silent network loss
+ * detectable: OkHttp's {@code pingInterval} fails the socket when pongs stop arriving, so a
+ * half-open connection (gateway restart, NAT timeout, Doze suspension) can't linger as
+ * {@code connected=true}. The app can accelerate recovery with OS events via {@link
+ * #networkLost()} (kill the transport now instead of waiting for the pong timeout) and {@link
+ * #networkAvailable()} (reconnect now) — both idempotent. Each connect attempt is bounded by a
+ * call timeout (covers DNS, which {@code connectTimeout} does not), so a hung attempt can never
+ * pin the connection. Auth failures recover on their own: the gateway rejects an expired-token
+ * upgrade with HTTP 401 (delivered to {@link Listener#onFailure}), a close before open of any
+ * code, or a {@code 1008} wiring-fault close; all trigger a single-flight reauth via {@link
+ * VaultController#reauth()}. On success the connection reopens with the fresh token
  * (streak-capped so a token the gateway keeps rejecting can't loop unthrottled), a transient
- * failure waits for the next network event, and a definitive rejection (404/401/403) halts the
- * chain.
+ * failure keeps backing off, and a definitive rejection (404/401/403) halts the chain.
  */
 public final class Connection {
   public interface Handler {
@@ -46,20 +48,30 @@ public final class Connection {
   /** Consecutive reauth→reopen cycles without a successful open before halting — the guard
    *  against a fresh token the gateway keeps rejecting (clock skew) looping unthrottled. */
   private static final int REAUTH_STREAK_CAP = 5;
-  /** Backs the {@link WsRequest} per-request timeouts only — no reconnect scheduling runs here. */
+  private static final long RECONNECT_INITIAL_MS = 250;
+  private static final long RECONNECT_CAP_MS = 30_000;
+  /** A socket open at least this long counts as "stable" — its close resets the backoff counter. */
+  private static final long RECONNECT_STABLE_MS = 30_000;
+  /** Backs the {@link WsRequest} per-request timeouts and the reconnect schedule. */
   private static final ScheduledExecutorService SCHED =
       Executors.newScheduledThreadPool(
           1,
           r -> {
-            Thread t = new Thread(r, "unimo-ws-timeout");
+            Thread t = new Thread(r, "unimo-ws-reconnect");
             t.setDaemon(true);
             return t;
           });
   /** callTimeout bounds each upgrade attempt end-to-end — including DNS, which connectTimeout
-   *  does not cover — and stops applying once the socket is established. No pingInterval: the
-   *  gateway (Bun, {@code sendPings} on) pings, and OkHttp answers pongs natively. */
+   *  does not cover — and stops applying once the socket is established. pingInterval detects
+   *  silent network loss: OkHttp fails the socket when pongs stop arriving, which is the only
+   *  way to notice a half-open connection (gateway restart, NAT timeout) without an OS event.
+   *  The gateway (Bun, {@code sendPings} on) also pings; both directions coexist per RFC 6455. */
   private static final OkHttpClient CLIENT =
-      new OkHttpClient.Builder().callTimeout(15, TimeUnit.SECONDS).readTimeout(0, TimeUnit.SECONDS).build();
+      new OkHttpClient.Builder()
+          .callTimeout(15, TimeUnit.SECONDS)
+          .pingInterval(20, TimeUnit.SECONDS)
+          .readTimeout(0, TimeUnit.SECONDS)
+          .build();
 
   private final String wsBase;
   private final String path;
@@ -77,6 +89,9 @@ public final class Connection {
   private volatile boolean reopenOnFailure;
   /** Consecutive REFRESHED-reauth reopens with no intervening onOpen; see {@link #REAUTH_STREAK_CAP}. */
   private volatile int reauthStreak;
+  /** Backoff attempt counter — guarded by {@code this} (scheduleReconnect's lock). */
+  private int reconnectAttempt;
+  private ScheduledFuture<?> reconnectTask;
 
   public Connection(String serviceUrl, VaultController vault) {
     this.wsBase = httpToWs(serviceUrl.replaceAll("/+$", ""));
@@ -94,6 +109,7 @@ public final class Connection {
   public void stop() {
     stopped = true;
     generation++; // any in-flight reauth must not reopen on the restarted connection
+    if (reconnectTask != null) reconnectTask.cancel(false);
     WebSocket w = this.ws;
     if (w != null) {
       try {
@@ -128,6 +144,10 @@ public final class Connection {
   public synchronized void networkAvailable() {
     if (stopped) return;
     reauthStreak = 0; // fresh external event = fresh intent
+    if (reconnectTask != null) { // pending reconnect is superseded by an immediate open
+      reconnectTask.cancel(false);
+      reconnectTask = null;
+    }
     WebSocket w = this.ws;
     if (w == null) {
       open();
@@ -263,7 +283,10 @@ public final class Connection {
     if (stopped) return;
     if (this.ws != null) return; // already connecting/connected; generation guard covers reauth races
     String token = vault.getAuthToken();
-    if (token == null) return; // pre-login; the next external event retries
+    if (token == null) { // pre-login; retry on backoff rather than waiting for an external event
+      scheduleReconnect();
+      return;
+    }
     // token (130-hex), vid/mid (64-hex) are all URL-safe — no percent-encoding needed.
     String url = wsBase + path + "?token=" + token + "&vid=" + vault.getId() + "&mid=" + vault.getMemberId();
     this.ws = CLIENT.newWebSocket(new Request.Builder().url(url).build(), new Listener());
@@ -293,23 +316,38 @@ public final class Connection {
     }
   }
 
+  private void scheduleReconnect() {
+    scheduleReconnect(false);
+  }
+
+  private synchronized void scheduleReconnect(boolean resetBackoff) {
+    if (stopped) return;
+    if (resetBackoff) reconnectAttempt = 0;
+    if (reconnectTask != null && !reconnectTask.isDone()) return;
+    int attempt = reconnectAttempt++;
+    double exp = Math.min(RECONNECT_INITIAL_MS * Math.pow(2, attempt), RECONNECT_CAP_MS);
+    // Uniform jitter over [0.75·exp, 1.25·exp)
+    long delay = (long) (exp * (0.75 + 0.5 * ThreadLocalRandom.current().nextDouble()));
+    reconnectTask = SCHED.schedule(this::open, delay, TimeUnit.MILLISECONDS);
+  }
+
   /** Whether a failed WS upgrade with this HTTP status should trigger a reauth before reconnecting.
    *  401 = expired/invalid token; 410 = manifest missing (a false 410 self-heals via reauth; a true
-   *  one yields 404 → REJECTED → halt). 0/transport-error/5xx/403… don't reauth — they stay down
-   *  until the next network event. Static for testing. */
+   *  one yields 404 → REJECTED → halt). 0/transport-error/5xx/403… don't reauth — backoff retries
+   *  them. Static for testing. */
   static boolean shouldReauthAfterUpgradeFailure(int status) {
     return status == 401 || status == 410;
   }
 
   /**
    * Reauths (single-flight via {@link VaultController#reauth()}) then acts on the outcome. Called
-   * from {@link Listener#onFailure} on an HTTP 401/410 upgrade rejection (the expired-token case)
-   * and from {@link Listener#onClosed} on a {@code 1008} close. REFRESHED reopens immediately,
-   * streak-capped by {@link #REAUTH_STREAK_CAP} so a fresh token the gateway keeps rejecting
-   * (clock skew) can't loop unthrottled; TRANSIENT stays down — the next network event retriggers
-   * the 401→reauth path. A {@code generation} snapshot drops the completion if a {@link
-   * #stop()}/{@link #start()} cycle happened in the meantime, so a late reauth can't double-open
-   * a socket on a restarted connection.
+   * from {@link Listener#onFailure} on an HTTP 401/410 upgrade rejection (the expired-token case),
+   * from {@link Listener#onClosed} on a {@code 1008} close, and from any close-before-open.
+   * REFRESHED reconnects promptly (backoff reset), streak-capped by {@link #REAUTH_STREAK_CAP} so
+   * a fresh token the gateway keeps rejecting (clock skew) can't loop unthrottled; TRANSIENT keeps
+   * backing off; a definitive rejection (404/401/403) halts the chain. A {@code generation}
+   * snapshot drops the completion if a {@link #stop()}/{@link #start()} cycle happened in the
+   * meantime, so a late reauth can't double-open a socket on a restarted connection.
    */
   private void runReauthThenReconnect() {
     final int gen = generation;
@@ -325,13 +363,14 @@ public final class Connection {
                   if (++reauthStreak > REAUTH_STREAK_CAP) {
                     System.err.println(
                         "[Connection] reauth keeps succeeding but the upgrade keeps failing ("
-                            + reauthStreak + "x) — halted until the next network event");
+                            + reauthStreak + "x) — reconnects throttled to backoff");
+                    scheduleReconnect();
                     break;
                   }
-                  open(); // fresh token — reconnect now
+                  scheduleReconnect(true); // fresh token — reconnect promptly
                   break;
                 case TRANSIENT:
-                  break; // stay down; the next network event retries
+                  scheduleReconnect(); // transient failure — retry on backoff
                 case REJECTED:
                 default:
                   System.err.println(
@@ -351,10 +390,20 @@ public final class Connection {
   }
 
   private final class Listener extends WebSocketListener {
+    /** Wall-clock ms when onOpen fired. Per-instance so a rejected upgrade (which never opens)
+     *  can't borrow a prior connection's uptime to reset backoff — the hot-loop bug. */
+    private long openedAtMs;
+    /** True once onOpen fired — a terminal callback before it is an upgrade that never opened. */
+    private boolean opened;
+
     @Override
     public void onOpen(WebSocket webSocket, Response response) {
       connected = true;
       reauthStreak = 0; // a real open clears the reauth-loop streak
+      opened = true;
+      openedAtMs = System.currentTimeMillis();
+      // Backoff is reset on close (stability-gated at the close site), NOT here — resetting
+      // here would let an accept-then-immediately-die cycle hot-loop at the 250ms floor.
     }
 
     @Override
@@ -384,8 +433,16 @@ public final class Connection {
         // 1008 is a policy/wiring-fault close (the gateway rejects expired auth at the HTTP
         // upgrade as 401, not via 1008); refresh the token, then reconnect on the outcome.
         runReauthThenReconnect();
+        return;
       }
-      // Any other close: stay down until the next network event.
+      if (!opened) {
+        // Close-before-open (port of the TS 78ccfa1 fix): an upgrade the server accepted then
+        // dropped without any auth signal. Refresh the token first — expiry is the common cause —
+        // then reconnect regardless of the refresh outcome.
+        runReauthThenReconnect();
+        return;
+      }
+      scheduleReconnect(System.currentTimeMillis() - openedAtMs >= RECONNECT_STABLE_MS);
     }
 
     @Override
@@ -404,7 +461,19 @@ public final class Connection {
         runReauthThenReconnect();
         return;
       }
-      if (reopen) open(); // the one non-auth reopen: networkAvailable() cancelled this socket
+      if (!opened) {
+        // Failure-before-open without an auth status (transport error during upgrade): the TS
+        // original reauths here too — a token rejected in a way that surfaces as a plain
+        // transport failure otherwise needs a full backoff cycle before the 401 path is hit.
+        runReauthThenReconnect();
+        return;
+      }
+      if (reopen) {
+        // networkAvailable() cancelled a half-dead socket — its terminal callback reopens now.
+        open();
+        return;
+      }
+      scheduleReconnect(System.currentTimeMillis() - openedAtMs >= RECONNECT_STABLE_MS);
     }
   }
 

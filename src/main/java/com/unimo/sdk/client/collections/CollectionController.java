@@ -106,14 +106,22 @@ public final class CollectionController {
         .download(vault, colId, colEncKey)
         .thenApply(
             dl -> {
-              byte[][] parts = parsePayload(dl.data);
-              this.meta = Json.parseObject(Helpers.fromUtf8(parts[0]));
-              this.meta.put("version", (long) dl.version);
               if (!Consts.COLLECTION_TYPE_KV.equals(colType)) {
                 throw new CodedException("Unsupported collection type: " + colType, "UNSUPPORTED_COLLECTION_TYPE");
               }
-              this.content = KVContent.deserialize(parts[1]);
-              if (autoSync) enableAutoSync();
+              if (content != null && dl.version <= getVersion()) {
+                if (autoSync) enableAutoSync();
+                return this.content;
+              }
+              byte[][] parts = parsePayload(dl.data);
+              this.meta = Json.parseObject(Helpers.fromUtf8(parts[0]));
+              this.meta.put("version", (long) dl.version);
+              if (content != null) {
+                content.merge(KVContent.deserialize(parts[1]));
+              } else {
+                this.content = KVContent.deserialize(parts[1]);
+                if (autoSync) enableAutoSync();
+              }
               return this.content;
             });
   }
