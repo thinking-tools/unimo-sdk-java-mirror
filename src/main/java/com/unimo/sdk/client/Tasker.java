@@ -8,12 +8,14 @@ import com.unimo.sdk.shared.Helpers;
 import com.unimo.sdk.shared.Json;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Supplier;
 
 /**
  * Port of the upload/download core of {@code sdk/ts/src_ts/client/Tasker.ts} (storage-v2).
@@ -147,7 +149,7 @@ public final class Tasker {
         String chunkId = Helpers.deriveChunkId(fileId, uploadNonce, i);
         String url = chunkUrl(v, fileId, predictedVersion, chunkId);
         puts.add(
-            ApiClient.send("PUT", url, ct, OCTET, authHeaders(v))
+            authedSend(v, "PUT", url, ct, Collections.emptyMap())
                 .thenAccept(
                     r -> {
                       if (r.status == 201) return;
@@ -179,7 +181,7 @@ public final class Tasker {
   // ── download ──
 
   private DownloadResult doDownload(VaultController v, String fileId, byte[] encKey) {
-    ApiClient.ApiResponse head = ApiClient.send("GET", fileUrl(v, fileId), null, authHeaders(v)).join();
+    ApiClient.ApiResponse head = authedSend(v, "GET", fileUrl(v, fileId), null, Collections.emptyMap()).join();
     if (head.status == 404) throw new CodedException("Not found", "NOT_FOUND");
     if (head.status == 410) throw new CodedException("File is trashed", "TRASHED");
     if (!head.ok()) throw new CodedException("GET failed: " + head.status, "GET_FAILED");
@@ -200,7 +202,7 @@ public final class Tasker {
     for (int i = 0; i < count; i++) {
       String chunkId = Helpers.deriveChunkId(fileId, uploadNonce, i);
       gets.add(
-          ApiClient.send("GET", chunkUrl(v, fileId, version, chunkId), null, authHeaders(v))
+          authedSend(v, "GET", chunkUrl(v, fileId, version, chunkId), null, Collections.emptyMap())
               .thenApply(
                   r -> {
                     if (!r.ok()) throw new CodedException("chunk GET failed: " + r.status, "CHUNK_GET_FAILED");
@@ -215,16 +217,43 @@ public final class Tasker {
 
   // ── HTTP helpers (blocking on the orchestration worker) ──
 
+  /**
+   * Storage twin of {@link VaultController#invokeAuthed}: single 401→reauth→retry. Tokens expire
+   * after 2h while the WebSocket stays open, so without this every storage call 401s until
+   * re-unlock. {@code extra} is merged over fresh auth headers per attempt.
+   */
+  private CompletableFuture<ApiClient.ApiResponse> authedSend(
+      VaultController v, String method, String url, byte[] body, Map<String, String> extra) {
+    return withReauth(
+        () -> {
+          Map<String, String> h = authHeaders(v);
+          h.putAll(extra);
+          return ApiClient.send(method, url, body, OCTET, h);
+        },
+        v::handleAuthError);
+  }
+
+  /** Pure retry policy: send; on 401 ask {@code reauth}; if it refreshed the token, send once more. */
+  static CompletableFuture<ApiClient.ApiResponse> withReauth(
+      Supplier<CompletableFuture<ApiClient.ApiResponse>> send, Supplier<CompletableFuture<Boolean>> reauth) {
+    return send.get()
+        .thenCompose(
+            r -> {
+              if (r.status != 401) return CompletableFuture.completedFuture(r);
+              return reauth.get().thenCompose(ok -> ok ? send.get() : CompletableFuture.completedFuture(r));
+            });
+  }
+
   private ApiClient.ApiResponse commitHead(
       VaultController v, String fileId, byte[] body, int chunkCount, Integer expectedVersion) {
-    Map<String, String> h = authHeaders(v);
+    Map<String, String> h = new java.util.HashMap<>();
     h.put(Consts.HEADER_CHUNK_COUNT, String.valueOf(chunkCount));
     if (expectedVersion != null) h.put(Consts.HEADER_EXPECTED_VERSION, String.valueOf(expectedVersion));
-    return ApiClient.send("PUT", fileUrl(v, fileId), body, OCTET, h).join();
+    return authedSend(v, "PUT", fileUrl(v, fileId), body, h).join();
   }
 
   private int headProbe(VaultController v, String fileId) {
-    ApiClient.ApiResponse r = ApiClient.send("HEAD", fileUrl(v, fileId), null, authHeaders(v)).join();
+    ApiClient.ApiResponse r = authedSend(v, "HEAD", fileUrl(v, fileId), null, Collections.emptyMap()).join();
     if (r.status == 404) return 0;
     if (r.status == 410) throw new CodedException("File is trashed", "TRASHED");
     if (!r.ok()) throw new CodedException("HEAD failed: " + r.status, "HEAD_FAILED");
