@@ -14,7 +14,9 @@ import com.unimo.sdk.crypto.CryptoUtils;
 import com.unimo.sdk.shared.Consts;
 import com.unimo.sdk.shared.Helpers;
 import com.unimo.sdk.shared.Json;
+import com.unimo.sdk.shared.Validators;
 import java.util.Arrays;
+import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 
@@ -53,12 +55,35 @@ public final class Client {
     }
   }
 
+  private static String normalizeEmail(String email) {
+    return email.trim().toLowerCase(Locale.ROOT);
+  }
+
+  /** Mail a 6-digit verification code to {@code email} (gateway-limited per IP and per address). */
+  public CompletableFuture<Void> requestEmailCode(String email) {
+    return ApiClient.makeRequest("POST", serviceUrl + "/api/auth/email/start", Json.obj("email", normalizeEmail(email)))
+        .thenApply(r -> null);
+  }
+
+  /** Verify the mailed code. On success {@link #register} with this email is accepted for 15 minutes. */
+  public CompletableFuture<Void> verifyEmailCode(String email, String code) {
+    return ApiClient.makeRequest(
+            "POST",
+            serviceUrl + "/api/auth/email/verify",
+            Json.obj("email", normalizeEmail(email), "code", code.trim()))
+        .thenApply(r -> null);
+  }
+
   /**
    * Provision a new account: an active ADMIN device + an OWNER recovery device (both wrapping the
    * same fresh master key), an account identity keypair (the vaultId), and a manager-only area
    * holding the account seed. The manifest is signed by the recovery (OWNER) device.
+   * {@code email} must have passed {@link #verifyEmailCode} within the last 15 minutes.
    */
-  public CompletableFuture<RegisterResult> register(String accountName, String deviceName, byte[] deviceSeed) {
+  public CompletableFuture<RegisterResult> register(
+      String accountName, String email, String deviceName, byte[] deviceSeed) {
+    String mail = normalizeEmail(email);
+    if (!Validators.validateEmail(mail)) throw new CodedException("Invalid email", "INVALID_EMAIL");
     byte[] thisDeviceSeed = deviceSeed != null ? deviceSeed : CryptoUtils.generateRandomBytes(Consts.DEFAULT_SEED_LENGTH_BYTES);
     byte[] recoverySeed = CryptoUtils.generateRandomBytes(Consts.DEFAULT_SEED_LENGTH_BYTES);
     byte[] masterKey = AEAD.generateRawAEADKeyData();
@@ -87,6 +112,7 @@ public final class Client {
         Json.obj(
             "version", 1,
             "name", accountName.trim(),
+            "email", mail,
             "type", Consts.VAULT_TYPE_ACCOUNT,
             "id", accountMember.memberId,
             "dsaPubkey", Helpers.base64(accountMember.dsaKeys.publicKey),

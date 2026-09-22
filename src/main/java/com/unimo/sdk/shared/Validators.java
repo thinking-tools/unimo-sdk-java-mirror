@@ -21,6 +21,8 @@ public final class Validators {
 
   private static final Pattern ACCOUNT_NAME = Pattern.compile("^[a-zA-Z0-9_-]+$");
   private static final Pattern ACCOUNT_ID = Pattern.compile("^[a-f0-9]{64}$");
+  private static final Pattern EMAIL =
+      Pattern.compile("^[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*\\.[a-zA-Z]{2,}$");
   private static final Pattern VAULT_NAME = Pattern.compile("^[\\x20-\\x7E]+$");
   private static final Pattern RESERVED_SUBSTR = Pattern.compile("(official|verified|staff|support|admin)", Pattern.CASE_INSENSITIVE);
   private static final String[] RESERVED_PREFIXES = {"admin", "mod", "support", "staff", "system", "official"};
@@ -53,6 +55,10 @@ public final class Validators {
   public static boolean validateAccountName(String accountName) {
     if (accountName == null || isAccountNameReserved(accountName)) return false;
     return accountName.length() >= 5 && accountName.length() <= 256 && ACCOUNT_NAME.matcher(accountName).matches();
+  }
+
+  public static boolean validateEmail(String email) {
+    return email != null && email.length() >= 6 && email.length() <= 256 && EMAIL.matcher(email).matches();
   }
 
   private static boolean validateVaultName(String vaultName) {

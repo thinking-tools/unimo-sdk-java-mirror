@@ -14,6 +14,13 @@ import com.unimo.sdk.crypto.CodedException;
 import com.unimo.sdk.crypto.CryptoUtils;
 import com.unimo.sdk.shared.Consts;
 import com.unimo.sdk.shared.Helpers;
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.io.OutputStream;
+import java.net.Socket;
+import java.net.URI;
+import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
@@ -40,8 +47,11 @@ public final class IntegrationRunner {
     String account = "itest_" + Helpers.hex(CryptoUtils.generateRandomBytes(6));
     byte[] seed1 = CryptoUtils.generateRandomBytes(32);
 
-    // Phase 2: register → login → unlock
-    Client.RegisterResult reg = await(client.register(account, "device1", seed1));
+    // Phase 2: email OTP → register → login → unlock
+    String email = account + "@unimo.test";
+    await(client.requestEmailCode(email));
+    await(client.verifyEmailCode(email, otpCode(email)));
+    Client.RegisterResult reg = await(client.register(account, email, "device1", seed1));
     check("register.ok", reg.ok);
 
     VaultController vc1 = await(client.login(account, seed1));
@@ -215,6 +225,41 @@ public final class IntegrationRunner {
     System.out.println();
     System.out.println("integration: " + pass + " passed, " + fail + " failed");
     System.exit(fail > 0 ? 1 : 0);
+  }
+
+  /**
+   * The gateway never mails in dev, so read the code it stored ({@code HGET auth:otp:{email} code})
+   * straight off Valkey over RESP. {@code UNIMO_VALKEY} defaults to the {@code dev:local} bundled
+   * instance; point it at {@code redis://127.0.0.1:6390} for a host-run {@code bun run dev}.
+   */
+  private static String otpCode(String email) throws IOException {
+    URI u = URI.create(System.getenv().getOrDefault("UNIMO_VALKEY", "redis://:devpass@127.0.0.1:6379"));
+    try (Socket s = new Socket(u.getHost(), u.getPort())) {
+      OutputStream out = s.getOutputStream();
+      BufferedReader in = new BufferedReader(new InputStreamReader(s.getInputStream(), StandardCharsets.UTF_8));
+      String userInfo = u.getUserInfo();
+      if (userInfo != null && !userInfo.isEmpty()) {
+        resp(out, "AUTH", userInfo.substring(userInfo.indexOf(':') + 1));
+        String reply = in.readLine();
+        if (reply == null || !reply.startsWith("+")) throw new IOException("valkey AUTH failed: " + reply);
+      }
+      resp(out, "HGET", "auth:otp:" + email, "code");
+      String len = in.readLine();
+      if (len == null || !len.startsWith("$") || len.equals("$-1")) {
+        throw new IOException("no OTP for " + email + " in valkey at " + u.getHost() + ":" + u.getPort()
+            + " (" + len + ") — set UNIMO_VALKEY to the gateway's Valkey");
+      }
+      return in.readLine();
+    }
+  }
+
+  private static void resp(OutputStream out, String... args) throws IOException {
+    StringBuilder sb = new StringBuilder("*").append(args.length).append("\r\n");
+    for (String a : args) {
+      sb.append('$').append(a.getBytes(StandardCharsets.UTF_8).length).append("\r\n").append(a).append("\r\n");
+    }
+    out.write(sb.toString().getBytes(StandardCharsets.UTF_8));
+    out.flush();
   }
 
   private static <T> T await(CompletableFuture<T> f) throws Exception {

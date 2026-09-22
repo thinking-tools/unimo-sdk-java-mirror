@@ -22,7 +22,7 @@ with the gateway and the TS SDK.
 
 **Feature-complete** vs the TypeScript SDK (the only TS gaps are also stubs there: `VFS`/`LIST`/`CRDTLIST` collection types, and the Tasker reactive task-queue/progress UI convenience). `Search` is a **Java-first** addition — the TS SDK has no search client yet; it speaks the gateway's WS `search` domain directly.
 
-Live coverage: **33/33** in `IntegrationRunner` (register/login/unlock · member add/remove + key rotation · reauth · single + multi-chunk encrypted storage + CAS · KV collection create/reload/rotate · billing catalog/state · full invite create→claim→finalize→login · WebSocket `vault:event` push · search suggest round-trip · Account wrapper; the full search-results checks self-skip loudly when the gateway lacks working search providers; set `UNIMO_SEARCH_LIVE=1` to FAIL instead). Offline cross-language conformance: **45/45**.
+Live coverage: **33/33** in `IntegrationRunner` (email OTP → register/login/unlock · member add/remove + key rotation · reauth · single + multi-chunk encrypted storage + CAS · KV collection create/reload/rotate · billing catalog/state · full invite create→claim→finalize→login · WebSocket `vault:event` push · search suggest round-trip · Account wrapper; the full search-results checks self-skip loudly when the gateway lacks working search providers; set `UNIMO_SEARCH_LIVE=1` to FAIL instead). Offline cross-language conformance: **45/45**.
 
 **UI binding:** `ReactiveValue<T>` is a neutral, dependency-free observable (`get`/`set`/`update`/`subscribe`/`onChange`). Adapt at the UI edge — `MutableLiveData` (`rv.subscribe(ld::postValue)`) for Views/Java, or `MutableStateFlow` (`rv.subscribe { flow.value = it }`, read via `collectAsState()`) for Compose. The core stays Android-free and pure-JVM-testable.
 
@@ -166,6 +166,8 @@ java -cp "out:$CP" conformance.ConformanceRunner conformance/vectors.json
 
 # Live end-to-end test (needs the `bun run dev:local` gateway up on :3000):
 java -cp "out:$CP" conformance.IntegrationRunner http://localhost:3000
+# Registration is email-OTP gated and dev gateways never mail: the runner reads the code off Valkey
+# (UNIMO_VALKEY, default redis://:devpass@127.0.0.1:6379 = the dev:local bundled instance).
 ```
 
 ## Conformance workflow
