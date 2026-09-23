@@ -41,6 +41,9 @@ public final class VaultController {
   private final Object reauthLock = new Object();
   /** Non-null while a reauth is in flight; {@link #reauth()} joins it instead of re-dispatching. */
   private CompletableFuture<ReauthOutcome> inFlightReauth;
+  /** Fired once when a reauth comes back {@link ReauthOutcome#REVOKED}: a manager removed this
+   *  device. Wired by {@link Account}. */
+  volatile Runnable onRevoked;
 
   /** Observable list of this vault's collections (decrypted from the manifest at unlock). */
   public final ReactiveValue<List<CollectionController>> collections = new ReactiveValue<>(new ArrayList<>());
@@ -260,6 +263,9 @@ public final class VaultController {
     REFRESHED,
     /** 404/401/403, or a 2xx with no usable token — genuine rejection; halting the chain is correct. */
     REJECTED,
+    /** A rejection carrying the gateway's {@code NOT_A_MEMBER} code: a manager removed this
+     *  member. Halts like REJECTED and fires {@link #onRevoked} so the app can wipe the account. */
+    REVOKED,
     /** 400 catch-all / 409 replay / 429 / 5xx / transport failure — momentary; retry on backoff. */
     TRANSIENT
   }
@@ -268,7 +274,7 @@ public final class VaultController {
    * Pure classification of a {@code POST /api/auth/reauth} response (route in
    * {@code secure.gateway.unimo/src/users/routes.ts}). Package-private + static so the
    * retryability rules are unit-testable in isolation, mirroring {@link #rollbackCheckedEpoch}.
-   * {@code body} is the parsed JSON for a 2xx, else null (non-2xx outcomes are status-driven).
+   * {@code body} is the parsed JSON when the response parses, else null.
    */
   static ReauthOutcome classifyReauth(int status, Map<String, Object> body) {
     if (status >= 200 && status < 300) {
@@ -282,7 +288,11 @@ public final class VaultController {
       // 2xx without a usable non-empty String authToken: gateway/version skew — treat as not-refreshed.
       return ReauthOutcome.REJECTED;
     }
-    // 404 account gone, 401 bad signature/revoked, 403 member removed: definitive, don't spin.
+    // The gateway's NOT_A_MEMBER (a 401 for a member it no longer lists): the one rejection with a
+    // known cause. Apps wipe the account on it, so a bare 401 (bad signature, clock skew) must not
+    // be promoted.
+    if (body != null && "NOT_A_MEMBER".equals(body.get("code"))) return ReauthOutcome.REVOKED;
+    // 404 account gone, 401 bad signature/clock skew, 403 role unknown: definitive, don't spin.
     if (status == 404 || status == 401 || status == 403) return ReauthOutcome.REJECTED;
     // 400 (catch-all incl. infra), 409 (replay — a duplicated POST can trip this), 429, 5xx: retry.
     return ReauthOutcome.TRANSIENT;
@@ -344,15 +354,21 @@ public final class VaultController {
             resp -> {
               Map<String, Object> parsed;
               try {
-                parsed = resp.ok() ? resp.jsonObject() : null;
+                parsed = resp.jsonObject();
               } catch (RuntimeException parseError) {
                 // 2xx with an unparseable body is a gateway/version bug — retry, don't halt.
-                return ReauthOutcome.TRANSIENT;
+                if (resp.ok()) return ReauthOutcome.TRANSIENT;
+                parsed = null;
               }
               ReauthOutcome outcome = classifyReauth(resp.status, parsed);
               if (outcome == ReauthOutcome.REFRESHED) {
                 // Safe: classifyReauth returns REFRESHED only when authToken is a non-empty String.
                 this.authToken = (String) parsed.get("authToken");
+              }
+              if (outcome == ReauthOutcome.REVOKED) {
+                Runnable r = onRevoked;
+                onRevoked = null; // fire once
+                if (r != null) r.run();
               }
               return outcome;
             })

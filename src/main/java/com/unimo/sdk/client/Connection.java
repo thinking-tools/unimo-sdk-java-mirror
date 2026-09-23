@@ -429,9 +429,10 @@ public final class Connection {
       // its already-registered future is failed here — no request can slip through unrejected.
       failPending("WebSocket closed: " + code + " " + reason);
       if (stopped) return;
-      if (code == 1008) {
+      if (code == 1008 || code == 4001) {
         // 1008 is a policy/wiring-fault close (the gateway rejects expired auth at the HTTP
-        // upgrade as 401, not via 1008); refresh the token, then reconnect on the outcome.
+        // upgrade as 401, not via 1008); 4001 is the gateway closing the socket because a manager
+        // removed this member — the reauth then answers NOT_A_MEMBER → REVOKED → halt.
         runReauthThenReconnect();
         return;
       }

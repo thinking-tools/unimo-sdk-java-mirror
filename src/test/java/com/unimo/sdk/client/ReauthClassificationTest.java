@@ -49,6 +49,17 @@ class ReauthClassificationTest {
   }
 
   @Test
+  void notAMemberIsRevoked() {
+    // The gateway's NOT_A_MEMBER code is the one rejection with a known cause: a manager removed
+    // this member. Apps wipe the account on REVOKED, so a bare 401 (bad signature, clock skew)
+    // must stay a plain REJECTED.
+    Map<String, Object> notAMember = new HashMap<>();
+    notAMember.put("code", "NOT_A_MEMBER");
+    assertEquals(VaultController.ReauthOutcome.REVOKED, VaultController.classifyReauth(401, notAMember), "401 NOT_A_MEMBER");
+    assertEquals(VaultController.ReauthOutcome.REJECTED, VaultController.classifyReauth(401, body(false, null)), "401 without the code");
+  }
+
+  @Test
   void malformedSuccessIsRejected() {
     // 2xx without ok+authToken is a gateway/version skew: not a usable refresh, don't adopt garbage.
     assertEquals(VaultController.ReauthOutcome.REJECTED, VaultController.classifyReauth(200, body(false, "tok")), "ok:false");

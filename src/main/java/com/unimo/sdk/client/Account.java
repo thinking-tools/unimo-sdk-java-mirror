@@ -12,7 +12,8 @@ import java.util.concurrent.CompletableFuture;
  * the common surface so callers don't thread a Tasker through every call. The TS reactive
  * task-list is deferred. Network awareness is the app's job: wire OS connectivity events into
  * {@link Connection#networkLost()} / {@link Connection#networkAvailable()} via {@link
- * #connection()} — see the README; that wiring is what recovers a dropped socket.
+ * #connection()} — see the README; that wiring is what recovers a dropped socket. {@link
+ * #onRevoked} tells the app when the gateway no longer accepts this device.
  */
 public final class Account {
   private final String serviceUrl;
@@ -35,6 +36,16 @@ public final class Account {
       this.connection = null;
       this.search = null;
     }
+  }
+
+  /** Called once, from an SDK thread, when the gateway no longer accepts this device because a
+   *  manager removed it (a reauth answered {@code NOT_A_MEMBER}); the live connection is stopped
+   *  first. The host should drop the session and wipe the account's local data. */
+  public void onRevoked(Runnable callback) {
+    vault.onRevoked = () -> {
+      if (connection != null) connection.stop();
+      callback.run();
+    };
   }
 
   public VaultController vault() {

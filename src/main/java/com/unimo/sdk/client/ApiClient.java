@@ -121,17 +121,29 @@ public final class ApiClient {
     return future;
   }
 
-  /** Unauthenticated JSON request that throws on non-2xx (register / login / reauth flows). */
+  /** Unauthenticated JSON request that throws on non-2xx (register / login / reauth flows); the
+   *  thrown code is {@link #errorCode}. */
   public static CompletableFuture<Map<String, Object>> makeRequest(String method, String url, Map<String, Object> body) {
     byte[] payload = body == null ? null : Helpers.utf8(Json.canonical(body));
     return send(method, url, payload, Collections.emptyMap())
         .thenApply(
             resp -> {
               if (!resp.ok()) {
-                throw new CodedException("HTTP " + resp.status + ": " + resp.text(), "HTTP_ERROR");
+                throw new CodedException("HTTP " + resp.status + ": " + resp.text(), errorCode(resp));
               }
               return resp.jsonObject();
             });
+  }
+
+  /** The gateway's JSON {@code code} for a non-2xx response (e.g. {@code NOT_A_MEMBER}), else
+   *  {@code HTTP_<status>}. */
+  static String errorCode(ApiResponse resp) {
+    try {
+      Object code = resp.jsonObject().get("code");
+      if (code instanceof String) return (String) code;
+    } catch (RuntimeException ignored) {
+    }
+    return "HTTP_" + resp.status;
   }
 
   /** Bearer-authenticated request; non-throwing (caller inspects status, e.g. 401 → reauth). */
