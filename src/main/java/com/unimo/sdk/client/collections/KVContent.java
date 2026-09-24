@@ -75,15 +75,12 @@ public final class KVContent {
   }
 
   /**
-   * Merge a remote snapshot over the local map, then re-apply local pending edits.
-   *
-   * <p>NOTE: the TS original ({@code KV.ts merge}) builds the merged map but returns it from
-   * {@code data$.update(fn)}, whose return value {@code ReactiveValue.update} discards — so the
-   * merge is silently dropped. This port applies the merge correctly via {@code set}.
+   * Replace the local map with a remote snapshot, then re-apply local pending edits. The remote is
+   * the base, not a union with the local map: a key another device deleted must not survive here,
+   * or this device's next save re-uploads it.
    */
   public void merge(KVContent remote) {
-    Map<String, Object> merged = new LinkedHashMap<>(data.get());
-    merged.putAll(remote.data.get());
+    Map<String, Object> merged = new LinkedHashMap<>(remote.data.get());
     for (Map.Entry<String, Pending> e : pending.entrySet()) {
       if (e.getValue().delete) merged.remove(e.getKey());
       else merged.put(e.getKey(), e.getValue().value);
