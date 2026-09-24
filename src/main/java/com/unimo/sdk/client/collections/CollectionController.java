@@ -131,6 +131,7 @@ public final class CollectionController {
     if (tasker == null || content == null || content.getPendingChanges() == null) {
       return CompletableFuture.completedFuture(null);
     }
+    Map<String, Object> uploaded = content.pendingSnapshot();
     byte[] blob = serialize();
     int expected = getVersion();
     return tasker
@@ -141,7 +142,7 @@ public final class CollectionController {
               Throwable err = (Throwable) ra[1];
               if (err == null) {
                 meta.put("version", (long) ((Tasker.UploadResult) ra[0]).version);
-                content.clearPending();
+                content.clearPending(uploaded);
                 return CompletableFuture.<Void>completedFuture(null);
               }
               if (isCasError(err)) return pullAndMerge();

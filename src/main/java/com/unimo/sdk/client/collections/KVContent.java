@@ -96,8 +96,17 @@ public final class KVContent {
     return out;
   }
 
-  public void clearPending() {
-    pending.clear();
+  /** The pending ops as opaque tokens, taken before a save serializes (see {@link #clearPending}). */
+  public Map<String, Object> pendingSnapshot() {
+    return new LinkedHashMap<>(pending);
+  }
+
+  /**
+   * Forget the ops in {@code uploaded} (a save's {@link #pendingSnapshot}). An op set or deleted
+   * during the upload is a different object and stays pending, like sdk-ts {@code clearPending}.
+   */
+  public void clearPending(Map<String, Object> uploaded) {
+    for (Map.Entry<String, Object> e : uploaded.entrySet()) pending.remove(e.getKey(), e.getValue());
   }
 
   private void validateKey(String key) {
