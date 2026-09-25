@@ -14,7 +14,7 @@ with the gateway and the TS SDK.
 | 1 | `crypto` + `shared` (byte-exact interop foundation) | ✅ done |
 | 2 | Identity: `Members`, `Validators`, register/login, `deriveKeys` unlock, `ApiClient` (OkHttp) | ✅ done — **live-verified** vs gateway (register→login→unlock) |
 | 3 | `VaultController`: manifest CAS PUT/GET, member add/remove + key rotation, reauth | ✅ done — **live-verified** (addMember+rotation, new-member login, reauth, removeMember) |
-| 4 | `Tasker`: chunked storage upload/download + CAS | ✅ done — **live-verified** (single + multi-chunk 8.4 MiB round-trips, CAS bump) |
+| 4 | `Tasker`: chunked storage upload/download/delete + CAS | ✅ done — **live-verified** (single + multi-chunk 8.4 MiB round-trips, CAS bump) |
 | 5 | Collections/KV + `ReactiveValue` observable (dependency-free) | ✅ done — **live-verified** (create/persist/reload + survives key rotation) |
 | 6a | Billing + Invites (manager-area read/write) | ✅ done — **live-verified** (create→claim→finalize→login; billing catalog/state) |
 | 6b | WebSocket `Connection` (`vault:event` push) + minimal `Account` | ✅ done — **live-verified** (real blob_put push received; Account upload/download) |

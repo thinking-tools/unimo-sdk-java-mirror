@@ -75,6 +75,26 @@ public final class Tasker {
     }
   }
 
+  public static final class DeleteResult {
+    /** Epoch ms the file entered trash; restorable until {@link #expiresAt}. */
+    public final long trashedAt;
+    public final long expiresAt;
+    public final int retentionDays;
+    /** True while the server is still moving objects to trash; restore refuses until it clears. */
+    public final boolean inflight;
+    public final int blobsAffected;
+    public final long bytesAffected;
+
+    DeleteResult(Map<String, Object> j) {
+      this.trashedAt = ((Number) j.get("trashedAt")).longValue();
+      this.expiresAt = ((Number) j.get("expiresAt")).longValue();
+      this.retentionDays = ((Number) j.get("retentionDays")).intValue();
+      this.inflight = Boolean.TRUE.equals(j.get("inflight"));
+      this.blobsAffected = ((Number) j.get("blobsAffected")).intValue();
+      this.bytesAffected = ((Number) j.get("bytesAffected")).longValue();
+    }
+  }
+
   /** Upload encrypted bytes under {@code fileId}. {@code expectedVersion} CAS-pins the current
    *  head (use {@code 0} to assert first-write); {@code null} HEAD-probes for multi-chunk. */
   public CompletableFuture<UploadResult> upload(
@@ -93,6 +113,20 @@ public final class Tasker {
 
   public CompletableFuture<DownloadResult> download(VaultController v, String fileId, byte[] encKey) {
     return CompletableFuture.supplyAsync(() -> doDownload(v, fileId, encKey), POOL);
+  }
+
+  /** Soft-delete {@code fileId}: every version moves to trash and stays restorable until
+   *  {@link DeleteResult#expiresAt}. 404 → {@code NOT_FOUND}; 409 (already trashed) → {@code TRASHED}. */
+  public CompletableFuture<DeleteResult> delete(VaultController v, String fileId) {
+    return authedSend(v, "DELETE", fileUrl(v, fileId), null, Collections.emptyMap())
+        .thenApply(
+            r -> {
+              if (r.status == 404) throw new CodedException("Not found", "NOT_FOUND");
+              if (r.status == 409) throw new CodedException("File is trashed", "TRASHED");
+              if (r.status == 401) throw new CodedException("Unauthorized", "UNAUTHORIZED");
+              if (!r.ok()) throw new CodedException("DELETE failed: " + r.status, "DELETE_FAILED");
+              return new DeleteResult(r.jsonObject());
+            });
   }
 
   // ── upload paths ──

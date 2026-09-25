@@ -18,6 +18,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 
 /**
  * Port of {@code sdk/ts/src_ts/client/Vault.ts} — Phase 2 subset: login + manifest validation +
@@ -591,13 +592,17 @@ public final class VaultController {
     }
     CollectionController col = findCollection(colId);
     if (col != null) col.dispose();
-    String url = serviceUrl + "/api/storage/" + getId() + "/" + colId;
-    return ApiClient.authRequest("DELETE", url, authToken, null, authedHeaders())
+    // Soft-delete via Tasker (reauth-on-401). A blob already gone (NOT_FOUND) or already trashed
+    // (TRASHED) still gets pruned from the manifest.
+    return tasker
+        .delete(this, colId)
+        .exceptionally(
+            err -> {
+              if (isAlreadyGone(err)) return null;
+              throw err instanceof RuntimeException ? (RuntimeException) err : new CompletionException(err);
+            })
         .thenCompose(
-            resp -> {
-              if (!resp.ok() && resp.status != 404) {
-                throw new CodedException("Storage delete failed: " + resp.status, "STORAGE_DELETE_FAILED");
-              }
+            x -> {
               List<CollectionController> kept = new ArrayList<>();
               for (CollectionController c : collections.get()) if (!colId.equals(c.getId())) kept.add(c);
               collections.set(kept);
@@ -605,6 +610,13 @@ public final class VaultController {
               return saveUpdate();
             })
         .thenApply(x -> true);
+  }
+
+  private static boolean isAlreadyGone(Throwable err) {
+    Throwable t = err instanceof CompletionException && err.getCause() != null ? err.getCause() : err;
+    if (!(t instanceof CodedException)) return false;
+    String code = ((CodedException) t).getCode();
+    return "NOT_FOUND".equals(code) || "TRASHED".equals(code);
   }
 
   private CollectionController findCollection(String colId) {

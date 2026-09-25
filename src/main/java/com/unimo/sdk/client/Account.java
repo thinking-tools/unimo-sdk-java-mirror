@@ -87,6 +87,11 @@ public final class Account {
     return tasker.download(vault, fileId, encKey);
   }
 
+  /** Soft-delete a file; see {@link Tasker#delete}. */
+  public CompletableFuture<Tasker.DeleteResult> delete(String fileId) {
+    return tasker.delete(vault, fileId);
+  }
+
   // ── collections ──
   public List<CollectionController> listCollections() {
     return vault.listCollections();

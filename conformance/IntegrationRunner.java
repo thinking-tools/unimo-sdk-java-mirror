@@ -114,6 +114,16 @@ public final class IntegrationRunner {
     Tasker.DownloadResult downBig = await(tasker.download(vc1, fileId2, encKey));
     check("storage.multi.roundTrip", Arrays.equals(big, downBig.data) && downBig.version == 1);
 
+    Tasker.DeleteResult del = await(tasker.delete(vc1, fileId2));
+    check("storage.delete.trashed", del.trashedAt > 0 && del.expiresAt > del.trashedAt && del.blobsAffected >= 1);
+    String afterDelete = null;
+    try {
+      await(tasker.download(vc1, fileId2, encKey));
+    } catch (CodedException e) {
+      afterDelete = e.getCode();
+    }
+    check("storage.delete.downloadIsTrashed", "TRASHED".equals(afterDelete));
+
     // Phase 5: collections (KV) — create, persist, reload, survive key rotation
     KVContent notes = await(vc1.createCollection("notes", "KV", tasker));
     notes.set("title", "first note");
