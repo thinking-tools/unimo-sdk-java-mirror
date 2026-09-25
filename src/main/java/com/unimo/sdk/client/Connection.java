@@ -77,6 +77,7 @@ public final class Connection {
   private final String path;
   private final VaultController vault;
   private final Map<String, Set<Handler>> handlers = new ConcurrentHashMap<>();
+  private final Set<Runnable> openListeners = ConcurrentHashMap.newKeySet();
   private final Set<CompletableFuture<Map<String, Object>>> pending = ConcurrentHashMap.newKeySet();
 
   private volatile WebSocket ws;
@@ -164,6 +165,16 @@ public final class Connection {
       Set<Handler> set = handlers.get(type);
       if (set != null) set.remove(handler);
     };
+  }
+
+  /**
+   * Run {@code listener} on every successful open — the first and each reconnect — on an OkHttp
+   * thread. {@code vault:event} frames are live-only, so anything that happened while the socket
+   * was down is only recoverable here (see {@link Tasker#hookVault}). Returns an unsubscribe handle.
+   */
+  public ReactiveValue.Subscription onOpen(Runnable listener) {
+    openListeners.add(listener);
+    return () -> openListeners.remove(listener);
   }
 
   public boolean send(Map<String, Object> msg) {
@@ -371,6 +382,7 @@ public final class Connection {
                   break;
                 case TRANSIENT:
                   scheduleReconnect(); // transient failure — retry on backoff
+                  break;
                 case REJECTED:
                 default:
                   System.err.println(
@@ -404,6 +416,13 @@ public final class Connection {
       openedAtMs = System.currentTimeMillis();
       // Backoff is reset on close (stability-gated at the close site), NOT here — resetting
       // here would let an accept-then-immediately-die cycle hot-loop at the 250ms floor.
+      for (Runnable l : openListeners) {
+        try {
+          l.run();
+        } catch (RuntimeException e) {
+          System.err.println("[Connection] open listener error: " + e);
+        }
+      }
     }
 
     @Override

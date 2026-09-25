@@ -100,8 +100,21 @@ public final class CollectionController {
 
   // ── load / save ──
 
+  /**
+   * First call downloads; later calls only refresh, and only when a body-less HEAD shows the
+   * server holding a newer version — so reloading an unchanged collection costs one header
+   * round-trip, not a download.
+   */
   public CompletableFuture<KVContent> load(Tasker tasker, boolean autoSync) {
     this.tasker = tasker;
+    if (content != null) {
+      return pullIfNewer(null)
+          .thenApply(
+              merged -> {
+                if (autoSync) enableAutoSync();
+                return this.content;
+              });
+    }
     return tasker
         .download(vault, colId, colEncKey)
         .thenApply(
@@ -109,19 +122,11 @@ public final class CollectionController {
               if (!Consts.COLLECTION_TYPE_KV.equals(colType)) {
                 throw new CodedException("Unsupported collection type: " + colType, "UNSUPPORTED_COLLECTION_TYPE");
               }
-              if (content != null && dl.version <= getVersion()) {
-                if (autoSync) enableAutoSync();
-                return this.content;
-              }
               byte[][] parts = parsePayload(dl.data);
               this.meta = Json.parseObject(Helpers.fromUtf8(parts[0]));
               this.meta.put("version", (long) dl.version);
-              if (content != null) {
-                content.merge(KVContent.deserialize(parts[1]));
-              } else {
-                this.content = KVContent.deserialize(parts[1]);
-                if (autoSync) enableAutoSync();
-              }
+              this.content = KVContent.deserialize(parts[1]);
+              if (autoSync) enableAutoSync();
               return this.content;
             });
   }
@@ -145,26 +150,43 @@ public final class CollectionController {
                 content.clearPending(uploaded);
                 return CompletableFuture.<Void>completedFuture(null);
               }
-              if (isCasError(err)) return pullAndMerge();
+              if (isCasError(err)) return pullAndMerge().thenApply(merged -> (Void) null);
               CompletableFuture<Void> failed = new CompletableFuture<>();
               failed.completeExceptionally(err instanceof CompletionException ? err.getCause() : err);
               return failed;
             });
   }
 
-  private CompletableFuture<Void> pullAndMerge() {
-    if (tasker == null) return CompletableFuture.completedFuture(null);
+  /**
+   * Watch refresh (see {@link Tasker.Watch}): pull + merge when the server holds a version newer
+   * than this copy. {@code knownVersion} comes from a change frame; null probes with a HEAD first.
+   * Completes true when newer remote content was merged.
+   */
+  public CompletableFuture<Boolean> pullIfNewer(Integer knownVersion) {
+    if (tasker == null || content == null) return CompletableFuture.completedFuture(false);
+    CompletableFuture<Integer> remote =
+        knownVersion != null ? CompletableFuture.completedFuture(knownVersion) : tasker.probeVersion(vault, colId);
+    return remote.thenCompose(v -> v > getVersion() ? pullAndMerge() : CompletableFuture.completedFuture(false));
+  }
+
+  /** Download + merge; a download no newer than this copy (a concurrent pull won) is dropped. */
+  private CompletableFuture<Boolean> pullAndMerge() {
+    if (tasker == null) return CompletableFuture.completedFuture(false);
     return tasker
         .download(vault, colId, colEncKey)
-        .thenAccept(
+        .thenApply(
             dl -> {
-              byte[][] parts = parsePayload(dl.data);
-              this.meta = Json.parseObject(Helpers.fromUtf8(parts[0]));
-              this.meta.put("version", (long) dl.version);
-              if (Consts.COLLECTION_TYPE_KV.equals(colType) && content != null) {
-                content.merge(KVContent.deserialize(parts[1]));
+              boolean newer = dl.version > getVersion();
+              if (newer) {
+                byte[][] parts = parsePayload(dl.data);
+                this.meta = Json.parseObject(Helpers.fromUtf8(parts[0]));
+                this.meta.put("version", (long) dl.version);
+                if (Consts.COLLECTION_TYPE_KV.equals(colType) && content != null) {
+                  content.merge(KVContent.deserialize(parts[1]));
+                }
               }
               if (content != null && content.getPendingChanges() != null) scheduleSave();
+              return newer;
             });
   }
 
@@ -174,6 +196,8 @@ public final class CollectionController {
     return save();
   }
 
+  /** Push local edits (debounced save) and pull remote ones (WS watch, when the tasker has a live
+   *  connection). */
   public void enableAutoSync() {
     if (contentSub != null) return;
     contentSub =
@@ -181,6 +205,7 @@ public final class CollectionController {
             m -> {
               if (content.getPendingChanges() != null) scheduleSave();
             });
+    if (tasker != null) tasker.watchCollection(vault, colId, this::pullIfNewer);
   }
 
   private void scheduleSave() {
@@ -195,6 +220,7 @@ public final class CollectionController {
   public void dispose() {
     if (contentSub != null) contentSub.close();
     if (syncTask != null) syncTask.cancel(false);
+    if (tasker != null) tasker.unwatchCollection(vault.getId(), colId);
   }
 
   // ── accessors / wiring ──

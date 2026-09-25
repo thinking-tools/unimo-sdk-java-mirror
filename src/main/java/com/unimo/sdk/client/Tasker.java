@@ -11,16 +11,19 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Consumer;
 import java.util.function.Supplier;
 
 /**
  * Port of the upload/download core of {@code sdk/ts/src_ts/client/Tasker.ts} (storage-v2).
- * The task-queue / reactive-progress / WS-watch control plane is deferred to later phases —
- * this is the encrypted blob transfer:
+ * The task-queue / reactive-progress control plane is deferred to later phases — this is the
+ * encrypted blob transfer plus the WS watch plane ({@link #hookVault}, {@link #watchCollection}):
  *
  * <ul>
  *   <li>Single-chunk (≤ {@link Consts#CHUNK_SIZE}): AEAD-encrypt → CAS head PUT.
@@ -44,9 +47,41 @@ public final class Tasker {
           });
 
   private final String endpoint;
+  private final Connection connection; // null = no live watch (keepAlive=false)
+  private final Map<String, VaultWatch> watches = new ConcurrentHashMap<>();
+  private final Set<Consumer<String>> remoteChangeListeners = ConcurrentHashMap.newKeySet();
 
   public Tasker(String serviceUrl) {
+    this(serviceUrl, null);
+  }
+
+  /** With a live {@code connection}, {@code vault:event} frames drive the watches and every
+   *  (re)open catches them up (see {@link #hookVault}). */
+  public Tasker(String serviceUrl, Connection connection) {
     this.endpoint = serviceUrl.replaceAll("/+$", "");
+    this.connection = connection;
+    if (connection != null) {
+      connection.on("vault:event", this::route);
+      connection.onOpen(this::catchUp);
+    }
+  }
+
+  /**
+   * Refresh of one watched file: pull when the server holds a newer version than the local copy.
+   * {@code knownVersion} is the version a frame announced, or null when unknown (reconnect
+   * catch-up) — probe first. Completes true when remote state was merged locally.
+   */
+  public interface Watch {
+    CompletableFuture<Boolean> refresh(Integer knownVersion);
+  }
+
+  static final class VaultWatch {
+    final Watch manifest;
+    final Map<String, Watch> files = new ConcurrentHashMap<>();
+
+    VaultWatch(Watch manifest) {
+      this.manifest = manifest;
+    }
   }
 
   public static final class UploadResult {
@@ -113,6 +148,110 @@ public final class Tasker {
 
   public CompletableFuture<DownloadResult> download(VaultController v, String fileId, byte[] encKey) {
     return CompletableFuture.supplyAsync(() -> doDownload(v, fileId, encKey), POOL);
+  }
+
+  /** Current server version of {@code fileId} via a body-less HEAD ({@code 0} when it has none). */
+  public CompletableFuture<Integer> probeVersion(VaultController v, String fileId) {
+    return CompletableFuture.supplyAsync(() -> headProbe(v, fileId), POOL);
+  }
+
+  // ── WS watch plane (port of the TS Tasker hookVault / watchCollection) ──
+
+  /**
+   * Keep {@code v}'s manifest current: refetch on {@code manifest_updated} frames newer than the
+   * held version, and on every (re)open. Frames are live-only, so the open-time pass — which also
+   * probes every {@link #watchCollection watched collection} — is what recovers changes made
+   * while the socket was down. No-op without a live connection. Idempotent.
+   */
+  public void hookVault(VaultController v) {
+    if (connection == null) return;
+    hook(
+        v.getId(),
+        known -> {
+          int before = v.getManifestVersion();
+          if (known != null && known <= before) return CompletableFuture.completedFuture(false);
+          return v.timeToFetchUpdate().thenApply(x -> v.getManifestVersion() != before);
+        });
+  }
+
+  /** Package-private seam for tests (a VaultController needs a live login). */
+  VaultWatch hook(String vaultId, Watch manifest) {
+    return watches.computeIfAbsent(vaultId, id -> new VaultWatch(manifest));
+  }
+
+  /** Route {@code colId}'s change frames (and the reconnect catch-up) to {@code watch}, replacing
+   *  any earlier watch for it. No-op without a live connection. */
+  public void watchCollection(VaultController v, String colId, Watch watch) {
+    if (connection == null) return;
+    hookVault(v);
+    watches.get(v.getId()).files.put(colId, watch);
+  }
+
+  public void unwatchCollection(String vaultId, String colId) {
+    VaultWatch w = watches.get(vaultId);
+    if (w != null) w.files.remove(colId);
+  }
+
+  /** Run {@code listener} (on an SDK thread) whenever a watch merged newer remote state: with the
+   *  collection's id for a watched collection's content, with null for the manifest (members, the
+   *  collections list). */
+  public ReactiveValue.Subscription onRemoteChange(Consumer<String> listener) {
+    remoteChangeListeners.add(listener);
+    return () -> remoteChangeListeners.remove(listener);
+  }
+
+  /**
+   * {@code vault:event} router. The frame's {@code version} ({@code head} on head_changed /
+   * blob_restored) lets a watch skip a change it already holds — e.g. this device's own upload —
+   * without a request. Frames without a {@code fileId} (presence, invite_claimed, …) are ignored:
+   * none of them changes the manifest, and the TS original's manifest refetch on them would fire
+   * on every member connect. Package-private for tests.
+   */
+  void route(Map<String, Object> msg) {
+    VaultWatch w = watches.get(String.valueOf(msg.get("vaultId")));
+    if (w == null) return;
+    Object v = msg.containsKey("version") ? msg.get("version") : msg.get("head");
+    Integer known = v instanceof Number ? ((Number) v).intValue() : null;
+    if ("manifest_updated".equals(msg.get("kind"))) {
+      run(w.manifest, known, null);
+      return;
+    }
+    String fileId = String.valueOf(msg.get("fileId"));
+    Watch f = w.files.get(fileId);
+    if (f != null) run(f, known, fileId);
+  }
+
+  /** Every (re)open: whatever changed while the socket was down produced frames nobody received. */
+  void catchUp() {
+    for (VaultWatch w : watches.values()) {
+      run(w.manifest, null, null);
+      for (Map.Entry<String, Watch> f : w.files.entrySet()) run(f.getValue(), null, f.getKey());
+    }
+  }
+
+  private void run(Watch watch, Integer known, String fileId) {
+    CompletableFuture<Boolean> refresh;
+    try {
+      refresh = watch.refresh(known);
+    } catch (RuntimeException e) {
+      refresh = new CompletableFuture<>();
+      refresh.completeExceptionally(e);
+    }
+    refresh.whenComplete(
+        (changed, err) -> {
+          if (err != null) {
+            System.err.println("[Tasker] watch refresh failed: " + err);
+            return;
+          }
+          if (!Boolean.TRUE.equals(changed)) return;
+          for (Consumer<String> l : remoteChangeListeners) {
+            try {
+              l.accept(fileId);
+            } catch (RuntimeException e) {
+              System.err.println("[Tasker] remote-change listener error: " + e);
+            }
+          }
+        });
   }
 
   /** Soft-delete {@code fileId}: every version moves to trash and stays restorable until

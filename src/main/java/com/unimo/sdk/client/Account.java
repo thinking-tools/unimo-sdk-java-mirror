@@ -5,11 +5,13 @@ import com.unimo.sdk.client.collections.KVContent;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
+import java.util.function.Consumer;
 
 /**
  * Minimal port of {@code sdk/ts/src_ts/client/Account.ts}: wraps a {@link VaultController} with a
  * {@link Tasker}, {@link Billing}, and (when {@code keepAlive}) a live {@link Connection}, exposing
- * the common surface so callers don't thread a Tasker through every call. The TS reactive
+ * the common surface so callers don't thread a Tasker through every call; with a live connection,
+ * loaded collections stay current on their own (see {@link #onRemoteChange}). The TS reactive
  * task-list is deferred. Network awareness is the app's job: wire OS connectivity events into
  * {@link Connection#networkLost()} / {@link Connection#networkAvailable()} via {@link
  * #connection()} — see the README; that wiring is what recovers a dropped socket. {@link
@@ -26,14 +28,16 @@ public final class Account {
   public Account(String serviceUrl, VaultController vault, boolean keepAlive) {
     this.serviceUrl = serviceUrl;
     this.vault = vault;
-    this.tasker = new Tasker(serviceUrl);
     this.billing = new Billing(serviceUrl, vault);
     if (keepAlive) {
       this.connection = new Connection(serviceUrl, vault);
+      this.tasker = new Tasker(serviceUrl, connection);
+      this.tasker.hookVault(vault); // before start(): the first open's catch-up must see the hook
       this.connection.start();
       this.search = new Search(this.connection);
     } else {
       this.connection = null;
+      this.tasker = new Tasker(serviceUrl);
       this.search = null;
     }
   }
@@ -120,6 +124,29 @@ public final class Account {
 
   public CompletableFuture<Map<String, Object>> finalizeInvite(String inviteId) {
     return vault.finalizeInvite(inviteId);
+  }
+
+  /**
+   * Run {@code listener} (on an SDK thread) after remote changes were merged locally — from a live
+   * {@code vault:event} push or the catch-up after every WebSocket reconnect. It receives the
+   * collection's name for a loaded collection's content (collections are watched once loaded via
+   * {@link #getCollection}), or null for the manifest (members, collections list — a collection
+   * another device just created shows up here). Never fires when keepAlive=false.
+   */
+  public ReactiveValue.Subscription onRemoteChange(Consumer<String> listener) {
+    return tasker.onRemoteChange(
+        colId -> {
+          if (colId == null) {
+            listener.accept(null);
+            return;
+          }
+          for (CollectionController c : vault.listCollections()) {
+            if (colId.equals(c.getId())) {
+              listener.accept(c.getName());
+              return;
+            }
+          }
+        });
   }
 
   /** Subscribe to live {@code vault:event} frames (no-op when keepAlive=false). */

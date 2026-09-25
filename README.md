@@ -17,12 +17,12 @@ with the gateway and the TS SDK.
 | 4 | `Tasker`: chunked storage upload/download/delete + CAS | ✅ done — **live-verified** (single + multi-chunk 8.4 MiB round-trips, CAS bump) |
 | 5 | Collections/KV + `ReactiveValue` observable (dependency-free) | ✅ done — **live-verified** (create/persist/reload + survives key rotation) |
 | 6a | Billing + Invites (manager-area read/write) | ✅ done — **live-verified** (create→claim→finalize→login; billing catalog/state) |
-| 6b | WebSocket `Connection` (`vault:event` push) + minimal `Account` | ✅ done — **live-verified** (real blob_put push received; Account upload/download) |
+| 6b | WebSocket `Connection` (`vault:event` push) + minimal `Account` + collection watch | ✅ done — **live-verified** (real blob_put push received; Account upload/download; another device's edit merged live and after a reconnect) |
 | 7 | WebSocket `Search` (typing suggestions + full web search) + `Connection` request/response | ✅ done — **live-verified** (suggest round-trip + error-frame path; full results need gateway search providers) |
 
 **Feature-complete** vs the TypeScript SDK (the only TS gaps are also stubs there: `VFS`/`LIST`/`CRDTLIST` collection types, and the Tasker reactive task-queue/progress UI convenience). `Search` is a **Java-first** addition — the TS SDK has no search client yet; it speaks the gateway's WS `search` domain directly.
 
-Live coverage: **33/33** in `IntegrationRunner` (email OTP → register/login/unlock · member add/remove + key rotation · reauth · single + multi-chunk encrypted storage + CAS · KV collection create/reload/rotate · billing catalog/state · full invite create→claim→finalize→login · WebSocket `vault:event` push · search suggest round-trip · Account wrapper; the full search-results checks self-skip loudly when the gateway lacks working search providers; set `UNIMO_SEARCH_LIVE=1` to FAIL instead). Offline cross-language conformance: **45/45**.
+Live coverage: **43/43** in `IntegrationRunner` (email OTP → register/login/unlock · member add/remove + key rotation · reauth · single + multi-chunk encrypted storage + CAS · KV collection create/reload/rotate · billing catalog/state · full invite create→claim→finalize→login · WebSocket `vault:event` push · search suggest round-trip · Account wrapper · collection watch: live edit, reconnect catch-up, manifest update; the full search-results checks self-skip loudly when the gateway lacks working search providers; set `UNIMO_SEARCH_LIVE=1` to FAIL instead). Offline cross-language conformance: **45/45**.
 
 **UI binding:** `ReactiveValue<T>` is a neutral, dependency-free observable (`get`/`set`/`update`/`subscribe`/`onChange`). Adapt at the UI edge — `MutableLiveData` (`rv.subscribe(ld::postValue)`) for Views/Java, or `MutableStateFlow` (`rv.subscribe { flow.value = it }`, read via `collectAsState()`) for Compose. The core stays Android-free and pure-JVM-testable.
 
@@ -121,10 +121,9 @@ wrapping it — keep the early-frame handler cheap and non-throwing.
 
 ## Connection recovery (Android wiring — required)
 
-The SDK sends **no pings and runs no reconnect timers**: keepalive is the gateway's job (the
-server pings; OkHttp answers pongs natively, zero code), and recovery is event-driven. Feed OS
-connectivity events into the connection — without this wiring a dropped connection stays down,
-because OkHttp cannot detect a silent network loss on its own:
+A dropped socket reconnects on its own (exponential backoff, 250 ms → 30 s), and client pings
+detect a half-open one within 20–40 s. OS events make recovery immediate instead of waiting on
+backoff or ping timeouts — feed them into the connection:
 
 ```java
 ConnectivityManager cm =
@@ -147,6 +146,29 @@ the background). `networkLost()` kills the transport at once instead of waiting 
 timeouts; `networkAvailable()` reconnects immediately, or cancels a half-dead attempt and
 retries once. Auth-expiry recovery (401 upgrade rejection / `1008` close → reauth → reopen)
 stays automatic and needs no wiring.
+
+## Staying current (collection watch)
+
+With `keepAlive`, a collection loaded through `Account.getCollection` stays current by itself —
+no polling, no reload on resume:
+
+```java
+KVContent notes = account.getCollection("notes").join(); // first load downloads, then watches
+account.onRemoteChange(name -> {                           // SDK thread — marshal to main
+  if ("notes".equals(name)) runOnUiThread(this::render);   // null = manifest changed
+});
+```
+
+- **Live:** a `vault:event` frame for the collection carries its new version; the SDK downloads
+  and merges only when that version is newer than the local copy (its own uploads cost nothing).
+- **Reconnect:** frames are live-only, so on every (re)open the SDK refetches the manifest and
+  sends one body-less `HEAD` per loaded collection, downloading only what moved while the socket
+  was down.
+- **Reload:** calling `getCollection` again on a loaded collection is a `HEAD`, not a download.
+
+`onRemoteChange` fires only when newer remote state was merged: with the collection's name for
+its content, or with null for the manifest (members, collections list — re-call `getCollection`
+to pick up a collection another device just created). Pending local edits survive every merge.
 
 ## Build & test
 

@@ -232,6 +232,45 @@ public final class IntegrationRunner {
     Tasker.DownloadResult acctDl = await(acct.download(acctFile, encKey));
     check("account.uploadDownloadRoundTrip", Arrays.equals(Helpers.utf8("via account"), acctDl.data));
 
+    // Phase 6c: collection watch — a second device's edits reach a loaded collection live over
+    // vault:event, and edits made while this device's socket was down arrive on reconnect.
+    Account reader = new Account(url, inviteVc, true);
+    AtomicReference<CountDownLatch> changed = new AtomicReference<>(new CountDownLatch(1));
+    List<String> changedNames = java.util.Collections.synchronizedList(new java.util.ArrayList<>());
+    reader.onRemoteChange(
+        name -> {
+          changedNames.add(name);
+          changed.get().countDown();
+        });
+    Thread.sleep(1500); // upgrade + first-open catch-up settle
+    KVContent readerNotes = await(reader.getCollection("notes"));
+    Account writer = new Account(url, await(client.login(account, seed1)), false);
+    KVContent writerNotes = await(writer.getCollection("notes"));
+    CollectionController writerCol = null;
+    for (CollectionController c : writer.listCollections()) if ("notes".equals(c.getName())) writerCol = c;
+
+    writerNotes.set("live", "pushed");
+    await(writerCol.flush());
+    check("watch.liveEditNotifies", changed.get().await(15, TimeUnit.SECONDS));
+    check("watch.liveEditMerged", "pushed".equals(readerNotes.get("live")));
+    check("watch.changeNamesItsCollection", changedNames.contains("notes"));
+
+    reader.connection().stop(); // socket down: the next frame is lost
+    changed.set(new CountDownLatch(1));
+    writerNotes.set("offline", "missed-frame");
+    await(writerCol.flush());
+    reader.connection().start(); // reopen → catch-up probe
+    check("watch.reconnectCatchUpNotifies", changed.get().await(15, TimeUnit.SECONDS));
+    check("watch.reconnectCatchUpMerged", "missed-frame".equals(readerNotes.get("offline")));
+
+    changed.set(new CountDownLatch(1));
+    await(writer.createNewCollection("extra", "KV")); // manifest_updated
+    boolean manifestNotified = changed.get().await(15, TimeUnit.SECONDS);
+    boolean sawExtra = false;
+    for (CollectionController c : reader.listCollections()) sawExtra |= "extra".equals(c.getName());
+    check("watch.manifestUpdateNotifies", manifestNotified && sawExtra);
+    reader.destroy();
+
     System.out.println();
     System.out.println("integration: " + pass + " passed, " + fail + " failed");
     System.exit(fail > 0 ? 1 : 0);
