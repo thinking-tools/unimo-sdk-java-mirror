@@ -19,10 +19,11 @@ with the gateway and the TS SDK.
 | 6a | Billing + Invites (manager-area read/write) | ✅ done — **live-verified** (create→claim→finalize→login; billing catalog/state) |
 | 6b | WebSocket `Connection` (`vault:event` push) + minimal `Account` + collection watch | ✅ done — **live-verified** (real blob_put push received; Account upload/download; another device's edit merged live and after a reconnect) |
 | 7 | WebSocket `Search` (typing suggestions + full web search) + `Connection` request/response | ✅ done — **live-verified** (suggest round-trip + error-frame path; full results need gateway search providers) |
+| 8 | WebSocket `LLM` (streamed text turns, cancel) | ✅ ported from TS `LLM.ts` — the live round-trip self-skips when the gateway has no model configured |
 
 **Feature-complete** vs the TypeScript SDK (the only TS gaps are also stubs there: `VFS`/`LIST`/`CRDTLIST` collection types, and the Tasker reactive task-queue/progress UI convenience). `Search` is a **Java-first** addition — the TS SDK has no search client yet; it speaks the gateway's WS `search` domain directly.
 
-Live coverage: **43/43** in `IntegrationRunner` (email OTP → register/login/unlock · member add/remove + key rotation · reauth · single + multi-chunk encrypted storage + CAS · KV collection create/reload/rotate · billing catalog/state · full invite create→claim→finalize→login · WebSocket `vault:event` push · search suggest round-trip · Account wrapper · collection watch: live edit, reconnect catch-up, manifest update; the full search-results checks self-skip loudly when the gateway lacks working search providers; set `UNIMO_SEARCH_LIVE=1` to FAIL instead). Offline cross-language conformance: **45/45**.
+Live coverage: **46 checks** in `IntegrationRunner` (email OTP → register/login/unlock · member add/remove + key rotation · reauth · single + multi-chunk encrypted storage + CAS · KV collection create/reload/rotate · billing catalog/state · full invite create→claim→finalize→login · WebSocket `vault:event` push · search suggest round-trip · model turn round-trip · Account wrapper · collection watch: live edit, reconnect catch-up, manifest update; the full search-results checks self-skip loudly when the gateway lacks working search providers, the model turn when it has no model; set `UNIMO_SEARCH_LIVE=1` / `UNIMO_LLM_LIVE=1` to FAIL instead). Offline cross-language conformance: **45/45**.
 
 **UI binding:** `ReactiveValue<T>` is a neutral, dependency-free observable (`get`/`set`/`update`/`subscribe`/`onChange`). Adapt at the UI edge — `MutableLiveData` (`rv.subscribe(ld::postValue)`) for Views/Java, or `MutableStateFlow` (`rv.subscribe { flow.value = it }`, read via `collectAsState()`) for Compose. The core stays Android-free and pure-JVM-testable.
 
@@ -118,6 +119,24 @@ socket is down or drops mid-request, `BAD_FRAME` when a `search:results` reply i
 (missing `data`), `EMPTY_QUERY` (thrown synchronously) for blank queries.
 A throwing `onSuggestions` callback rejects the future with a `HANDLER_ERROR` `CodedException`
 wrapping it — keep the early-frame handler cheap and non-throwing.
+
+## Model turns
+
+On an account with a live connection (`keepAlive=true`), `account.llm()` streams one text turn
+through the gateway's model proxy over the same WebSocket (`llm:request` → `llm:delta`… →
+`llm:end`; quota-counted). No tools; a turn cut at the token cap ends with `finishReason`
+`"length"`; a gateway fault rejects with a `CodedException` carrying its code (`LLM_DISABLED`,
+`UPSTREAM`, `RATE_LIMITED`, `TIER_UNAVAILABLE`, …); `EMPTY_MESSAGES` is thrown synchronously.
+Cancelling the future (`turn.cancel(false)`) tells the gateway with `llm:cancel`.
+
+```java
+LLM.Options o = new LLM.Options();
+o.onDelta = piece -> System.out.print(piece); // socket reader thread, in order
+LLM.Turn turn = account.llm().complete(Arrays.asList(
+    new LLM.Message("system", "Answer briefly."),
+    new LLM.Message("user", "What is unimo?")), o).get();
+turn.text; // every delta, joined
+```
 
 ## Connection recovery (Android wiring — required)
 

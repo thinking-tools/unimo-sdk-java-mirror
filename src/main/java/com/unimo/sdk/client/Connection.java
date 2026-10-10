@@ -213,6 +213,7 @@ public final class Connection {
     private String intermediateType;
     private Handler intermediateHandler;
     private long timeoutMs = 20_000;
+    private String cancelType;
 
     private WsRequest(String terminalType, Map<String, Object> msg) {
       this.terminalType = terminalType;
@@ -230,6 +231,13 @@ public final class Connection {
 
     public WsRequest timeoutMs(long ms) {
       this.timeoutMs = ms;
+      return this;
+    }
+
+    /** Cancelling the {@link #send()} future tells the gateway with a {@code { type, id }} frame
+     *  (e.g. {@code llm:cancel}) — the port of the TS {@code AbortSignal} hook. Null → nothing is sent. */
+    public WsRequest cancelWith(String type) {
+      this.cancelType = type;
       return this;
     }
 
@@ -276,6 +284,9 @@ public final class Connection {
             terminal.close();
             error.close();
             if (intermediate != null) intermediate.close();
+            if (cancelType != null && future.isCancelled()) {
+              Connection.this.send(Json.obj("type", cancelType, "id", id));
+            }
           });
 
       Map<String, Object> withId = new LinkedHashMap<>(msg);

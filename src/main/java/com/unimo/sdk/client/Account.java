@@ -24,6 +24,7 @@ public final class Account {
   private final Billing billing;
   private final Connection connection; // null when keepAlive=false
   private final Search search; // null when keepAlive=false
+  private final LLM llm; // null when keepAlive=false
 
   public Account(String serviceUrl, VaultController vault, boolean keepAlive) {
     this.serviceUrl = serviceUrl;
@@ -35,10 +36,12 @@ public final class Account {
       this.tasker.hookVault(vault); // before start(): the first open's catch-up must see the hook
       this.connection.start();
       this.search = new Search(this.connection);
+      this.llm = new LLM(this.connection);
     } else {
       this.connection = null;
       this.tasker = new Tasker(serviceUrl);
       this.search = null;
+      this.llm = null;
     }
   }
 
@@ -72,6 +75,11 @@ public final class Account {
   /** WebSocket search over the live connection (or null when keepAlive=false). */
   public Search search() {
     return search;
+  }
+
+  /** Streamed model turns over the live connection (or null when keepAlive=false) — see {@link LLM}. */
+  public LLM llm() {
+    return llm;
   }
 
   public boolean isManagerMember() {

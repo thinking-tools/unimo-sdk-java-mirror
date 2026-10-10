@@ -4,6 +4,7 @@ import com.unimo.sdk.Client;
 import com.unimo.sdk.client.Account;
 import com.unimo.sdk.client.Billing;
 import com.unimo.sdk.client.Connection;
+import com.unimo.sdk.client.LLM;
 import com.unimo.sdk.client.Members;
 import com.unimo.sdk.client.Search;
 import com.unimo.sdk.client.Tasker;
@@ -22,6 +23,7 @@ import java.net.Socket;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
@@ -219,6 +221,34 @@ public final class IntegrationRunner {
         check("search.roundTrip (" + e.getCode() + ")", false);
       } else {
         System.out.println("  SKIP search round-trip — no provider configured? set UNIMO_SEARCH_LIVE=1 to enforce: "
+            + e.getMessage() + " [" + e.getCode() + "]");
+      }
+    }
+
+    // Phase 7b: WebSocket model turn. A gateway without a model key answers LLM_DISABLED — SKIP
+    // loudly then (UNIMO_LLM_LIVE=1 FAILs); any other code is a real regression.
+    LLM llm = new LLM(conn);
+    boolean emptyTurnRejected = false;
+    try {
+      llm.complete(Collections.<LLM.Message>emptyList());
+    } catch (CodedException e) {
+      emptyTurnRejected = "EMPTY_MESSAGES".equals(e.getCode());
+    }
+    check("llm.emptyMessagesRejectedLocally", emptyTurnRejected);
+    try {
+      StringBuilder streamed = new StringBuilder();
+      LLM.Options o = new LLM.Options();
+      o.maxTokens = 20;
+      o.onDelta = streamed::append;
+      LLM.Turn turn = await(llm.complete(Arrays.asList(
+          new LLM.Message("system", "Answer with one word."), new LLM.Message("user", "Say hello.")), o));
+      check("llm.turn.textIsTheJoinedDeltas", turn != null && !turn.text.isEmpty() && turn.text.contentEquals(streamed));
+      check("llm.turn.finishReason", turn != null && turn.finishReason != null);
+    } catch (CodedException e) {
+      if ("1".equals(System.getenv("UNIMO_LLM_LIVE")) || !"LLM_DISABLED".equals(e.getCode())) {
+        check("llm.roundTrip (" + e.getCode() + ")", false);
+      } else {
+        System.out.println("  SKIP llm round-trip — no model configured? set UNIMO_LLM_LIVE=1 to enforce: "
             + e.getMessage() + " [" + e.getCode() + "]");
       }
     }
