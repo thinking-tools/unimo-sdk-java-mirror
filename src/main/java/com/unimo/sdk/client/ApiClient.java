@@ -32,6 +32,12 @@ public final class ApiClient {
           .writeTimeout(30, TimeUnit.SECONDS)
           .build();
 
+  /** Pooled sockets die silently while the app is backgrounded and OkHttp never retries a sent
+   *  POST on HTTP/2: a request after a pause starts on a fresh connection. Test-tunable. */
+  static long idleResetNanos = TimeUnit.SECONDS.toNanos(10);
+
+  private static volatile long lastSendNanos = System.nanoTime();
+
   private ApiClient() {}
 
   /** A consumed HTTP response: status, body bytes, and lower-cased single-value headers. */
@@ -94,6 +100,10 @@ public final class ApiClient {
       default:
         throw new IllegalArgumentException("Unsupported method: " + method);
     }
+
+    long now = System.nanoTime();
+    if (now - lastSendNanos > idleResetNanos) CLIENT.connectionPool().evictAll();
+    lastSendNanos = now;
 
     CompletableFuture<ApiResponse> future = new CompletableFuture<>();
     CLIENT.newCall(rb.build())
