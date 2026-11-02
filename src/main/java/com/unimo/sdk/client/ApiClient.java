@@ -12,6 +12,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import okhttp3.Call;
 import okhttp3.Callback;
+import okhttp3.ConnectionPool;
 import okhttp3.MediaType;
 import okhttp3.OkHttpClient;
 import okhttp3.Request;
@@ -30,13 +31,11 @@ public final class ApiClient {
           .connectTimeout(15, TimeUnit.SECONDS)
           .readTimeout(30, TimeUnit.SECONDS)
           .writeTimeout(30, TimeUnit.SECONDS)
+          // Pooled sockets die silently while the app is backgrounded and OkHttp never retries a
+          // sent POST on HTTP/2: drop idle connections early. The pool closes them on its own
+          // thread; closing a TLS socket on Android's main thread throws NetworkOnMainThreadException.
+          .connectionPool(new ConnectionPool(5, 10, TimeUnit.SECONDS))
           .build();
-
-  /** Pooled sockets die silently while the app is backgrounded and OkHttp never retries a sent
-   *  POST on HTTP/2: a request after a pause starts on a fresh connection. Test-tunable. */
-  static long idleResetNanos = TimeUnit.SECONDS.toNanos(10);
-
-  private static volatile long lastSendNanos = System.nanoTime();
 
   private ApiClient() {}
 
@@ -100,10 +99,6 @@ public final class ApiClient {
       default:
         throw new IllegalArgumentException("Unsupported method: " + method);
     }
-
-    long now = System.nanoTime();
-    if (now - lastSendNanos > idleResetNanos) CLIENT.connectionPool().evictAll();
-    lastSendNanos = now;
 
     CompletableFuture<ApiResponse> future = new CompletableFuture<>();
     CLIENT.newCall(rb.build())
