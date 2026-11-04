@@ -81,7 +81,7 @@ public final class Validators {
   }
 
   @SuppressWarnings("unchecked")
-  public static Map<String, Object> getMemberFromMemberSlots(List<Object> memberSlots, String memberId) {
+  public static Map<String, Object> getMemberFromMemberSlots(List<?> memberSlots, Object memberId) {
     if (memberSlots == null) return null;
     for (Object o : memberSlots) {
       Map<String, Object> m = (Map<String, Object>) o;

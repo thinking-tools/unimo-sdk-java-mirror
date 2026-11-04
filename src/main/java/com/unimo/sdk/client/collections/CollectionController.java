@@ -64,7 +64,7 @@ public final class CollectionController {
   }
 
   private static Map<String, Object> defaultMeta(String memberId) {
-    long now = Helpers.now();
+    long now = System.currentTimeMillis();
     return Json.obj(
         "epoch", 0, "version", 0, "createdAt", now, "createdById", memberId, "modifiedAt", now,
         "modifiedById", memberId, "archived", false, "archivedAt", null, "toDelete", false);
@@ -263,7 +263,7 @@ public final class CollectionController {
   public void setName(String newName, String memberId) {
     this.colName = newName;
     if (meta != null) {
-      meta.put("modifiedAt", Helpers.now());
+      meta.put("modifiedAt", System.currentTimeMillis());
       meta.put("modifiedById", memberId);
     }
   }

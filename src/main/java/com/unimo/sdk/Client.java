@@ -180,7 +180,7 @@ public final class Client {
             "kemPub", Helpers.base64(member.kemKeys.publicKey),
             "dsaPub", Helpers.base64(member.dsaKeys.publicKey),
             "requestedName", requestedName.trim(),
-            "timestamp", Helpers.now());
+            "timestamp", System.currentTimeMillis());
     String sealed = Invites.sealClaim(channelKey, payload, member.dsaKeys);
     return ApiClient.makeRequest(
             "POST", serviceUrl + "/api/auth/invite/" + inviteId + "/claim", Json.obj("sealed", sealed))

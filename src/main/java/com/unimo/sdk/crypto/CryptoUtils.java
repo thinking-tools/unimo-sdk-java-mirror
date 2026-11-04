@@ -5,7 +5,6 @@ import com.unimo.sdk.shared.Helpers;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.security.SecureRandom;
-import java.util.UUID;
 import org.bouncycastle.crypto.digests.CSHAKEDigest;
 
 /**
@@ -28,10 +27,6 @@ public final class CryptoUtils {
 
   public static byte[] generateRandomBytes() {
     return generateRandomBytes(32);
-  }
-
-  public static String generateRandomUUID() {
-    return UUID.randomUUID().toString();
   }
 
   public static byte[] sha256(byte[] data) {

@@ -106,7 +106,7 @@ public final class ConformanceRunner {
     // Canonical JSON byte-equality + hash
     for (Object o : list(v, "canonicalJson")) {
       Map<String, Object> c = cast(o);
-      String canon = Helpers.generateCanonicalJSON(c.get("value"));
+      String canon = Json.canonical(c.get("value"));
       eq("canonicalJson[" + c.get("name") + "]", str(c, "canonical"), canon);
       if (c.containsKey("sha256Hex")) {
         eq("canonicalJson[" + c.get("name") + "].sha256", str(c, "sha256Hex"), Helpers.hex(CryptoUtils.sha256(canon)));

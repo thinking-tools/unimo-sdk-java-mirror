@@ -17,6 +17,7 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 
@@ -188,22 +189,11 @@ public final class VaultController {
   @SuppressWarnings("unchecked")
   private CompletableFuture<ManifestResult> fetchLatestManifest() {
     String url = serviceUrl + "/api/auth/manifest";
-    return ApiClient.authRequest("GET", url, authToken, null, authedHeaders())
-        .thenCompose(
-            resp -> {
-              if (resp.status == 401) {
-                return handleAuthError()
-                    .thenCompose(
-                        ok ->
-                            ok
-                                ? ApiClient.authRequest("GET", url, authToken, null, authedHeaders())
-                                : CompletableFuture.completedFuture(null));
-              }
-              return CompletableFuture.completedFuture(resp);
-            })
+    return Tasker.withReauth(
+            () -> ApiClient.authRequest("GET", url, authToken, null, authedHeaders()), this::handleAuthError)
         .thenApply(
             resp -> {
-              if (resp == null || !resp.ok()) return null;
+              if (!resp.ok()) return null;
               Map<String, Object> body = resp.jsonObject();
               if (!Boolean.TRUE.equals(body.get("ok"))) return null;
               return new ManifestResult((Map<String, Object>) body.get("accountVault"), intOr(body.get("version"), 1));
@@ -280,7 +270,7 @@ public final class VaultController {
   static ReauthOutcome classifyReauth(int status, Map<String, Object> body) {
     if (status >= 200 && status < 300) {
       // TS does `if (response.ok && response.authToken)` — JS truthiness, so "" is rejected. Match
-      // that with a non-empty String, and require String so the (String) cast in doReauth can't throw
+      // that with a non-empty String, and require String so the (String) cast in dispatchReauth can't throw
       // (a non-String would otherwise ClassCastException into a swallowed TRANSIENT = infinite retry).
       if (body != null && Boolean.TRUE.equals(body.get("ok"))) {
         Object tok = body.get("authToken");
@@ -309,7 +299,15 @@ public final class VaultController {
   CompletableFuture<ReauthOutcome> reauth() {
     synchronized (reauthLock) {
       if (inFlightReauth != null) return inFlightReauth;
-      CompletableFuture<ReauthOutcome> f = doReauth();
+      CompletableFuture<ReauthOutcome> started;
+      try {
+        started = dispatchReauth();
+      } catch (RuntimeException e) {
+        // a sync throw (sign/sha256 preamble, send()'s sync part) must still yield a future, or
+        // Connection's reconnect .whenComplete never attaches and the WebSocket stalls silently
+        started = CompletableFuture.completedFuture(ReauthOutcome.TRANSIENT);
+      }
+      final CompletableFuture<ReauthOutcome> f = started;
       inFlightReauth = f;
       f.whenComplete(
           (r, e) -> {
@@ -321,20 +319,6 @@ public final class VaultController {
     }
   }
 
-  /**
-   * Guards {@link #dispatchReauth()} so a synchronous throw (from the sign/sha256/getId preamble,
-   * or send()'s sync portion) never escapes: doReauth always returns a normally-completing future,
-   * so reauth() — and Connection's .whenComplete — always attach. A sync throw otherwise leaves
-   * reauth() with no future and stalls the WebSocket reconnect silently.
-   */
-  private CompletableFuture<ReauthOutcome> doReauth() {
-    try {
-      return dispatchReauth();
-    } catch (RuntimeException ignored) {
-      return CompletableFuture.completedFuture(ReauthOutcome.TRANSIENT);
-    }
-  }
-
   private CompletableFuture<ReauthOutcome> dispatchReauth() {
     long nowTime = System.currentTimeMillis();
     Map<String, Object> payload =
@@ -342,7 +326,7 @@ public final class VaultController {
             "memberId", activeMember.memberId,
             "vaultId", getId(),
             "timestamp", nowTime,
-            "reqId", CryptoUtils.generateRandomUUID());
+            "reqId", UUID.randomUUID().toString());
     byte[] hash = CryptoUtils.sha256(Helpers.utf8(Json.canonical(payload)));
     Map<String, Object> body =
         Json.obj(
@@ -409,7 +393,7 @@ public final class VaultController {
     for (Object so : newSlots) {
       @SuppressWarnings("unchecked")
       Map<String, Object> slot = (Map<String, Object>) so;
-      Map<String, Object> detail = findById(newDetails, slot.get("memberId"));
+      Map<String, Object> detail = Validators.getMemberFromMemberSlots(newDetails, slot.get("memberId"));
       if (detail == null) throw new CodedException("Missing detail for " + slot.get("memberId"), "MISSING_DETAIL");
       CryptoPQ.Encapsulated enc = CryptoPQ.encapsulate(Helpers.fromBase64((String) detail.get("memberKemPubkey")));
       byte[] roleKey = CryptoUtils.deriveKeyForRole((String) slot.get("memberRole"), newVaultKey);
@@ -468,7 +452,7 @@ public final class VaultController {
     List<Map<String, Object>> newDetails = new ArrayList<>(memberList);
     newDetails.add(newDetail);
     rotateAndRewrapForMembers(newSlots, newDetails);
-    return saveUpdate().thenApply(x -> findById(slots(), memberId));
+    return saveUpdate().thenApply(x -> Validators.getMemberFromMemberSlots(slots(), memberId));
   }
 
   /** Add a member from a seed (derives its keypair, then {@link #addMemberByPublicKeys}). */
@@ -486,7 +470,7 @@ public final class VaultController {
     if (memberId.equals(activeMember.memberId)) {
       throw new CodedException("Cannot remove yourself", "REMOVE_SELF");
     }
-    if (findById(slots(), memberId) == null) throw new CodedException("Member not found", "MEMBER_NOT_FOUND");
+    if (Validators.getMemberFromMemberSlots(slots(), memberId) == null) throw new CodedException("Member not found", "MEMBER_NOT_FOUND");
     List<Object> newSlots = new ArrayList<>();
     for (Object s : slots()) if (!memberId.equals(((Map<?, ?>) s).get("memberId"))) newSlots.add(s);
     List<Map<String, Object>> newDetails = new ArrayList<>();
@@ -634,32 +618,14 @@ public final class VaultController {
     return (List<Object>) payload().get("memberSlots");
   }
 
-  @SuppressWarnings("unchecked")
-  private static Map<String, Object> findById(List<?> items, Object memberId) {
-    for (Object o : items) {
-      Map<String, Object> m = (Map<String, Object>) o;
-      if (memberId.equals(m.get("memberId"))) return m;
-    }
-    return null;
-  }
-
   // ── manager-only area + invites ──
 
   /** Bearer-authed request with a single 401→reauth→retry (shared by invites + billing). */
   public CompletableFuture<ApiClient.ApiResponse> invokeAuthed(String method, String path, Map<String, Object> body) {
     if (authToken == null) throw new CodedException("Not authenticated", "NOT_AUTHENTICATED");
     String url = serviceUrl + path;
-    return ApiClient.authRequest(method, url, authToken, body, authedHeaders())
-        .thenCompose(
-            resp -> {
-              if (resp.status != 401) return CompletableFuture.completedFuture(resp);
-              return handleAuthError()
-                  .thenCompose(
-                      ok ->
-                          ok
-                              ? ApiClient.authRequest(method, url, authToken, body, authedHeaders())
-                              : CompletableFuture.completedFuture(resp));
-            });
+    return Tasker.withReauth(
+        () -> ApiClient.authRequest(method, url, authToken, body, authedHeaders()), this::handleAuthError);
   }
 
   private Map<String, Object> readManagerArea() {
@@ -686,7 +652,7 @@ public final class VaultController {
   @SuppressWarnings("unchecked")
   public CompletableFuture<Void> addPendingInvite(Map<String, Object> entry) {
     Map<String, Object> area = readManagerArea();
-    long cutoff = Helpers.now() - Consts.INVITE_MAX_TTL_SECONDS * 1000;
+    long cutoff = System.currentTimeMillis() - Consts.INVITE_MAX_TTL_SECONDS * 1000;
     List<Object> next = new ArrayList<>();
     for (Object o : invitesOf(area)) {
       Map<String, Object> i = (Map<String, Object>) o;
@@ -739,7 +705,7 @@ public final class VaultController {
     byte[] secret = CryptoUtils.generateRandomBytes(Consts.INVITE_SECRET_LENGTH_BYTES);
     String inviteId = Invites.deriveInviteId(secret);
     Map<String, Object> entry =
-        Json.obj("inviteId", inviteId, "inviteSecret", Helpers.base64(secret), "role", role, "createdAt", Helpers.now());
+        Json.obj("inviteId", inviteId, "inviteSecret", Helpers.base64(secret), "role", role, "createdAt", System.currentTimeMillis());
     Map<String, Object> body =
         ttlSeconds != null
             ? Json.obj("inviteId", inviteId, "role", role, "ttlSeconds", ttlSeconds)

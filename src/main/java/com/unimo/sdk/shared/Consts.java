@@ -1,9 +1,6 @@
 package com.unimo.sdk.shared;
 
 import java.util.Arrays;
-import java.util.Collections;
-import java.util.HashSet;
-import java.util.Set;
 
 /**
  * Port of {@code sdk/ts/src_ts/shared/Consts.ts}. Wire-contract constants shared with the
@@ -31,20 +28,12 @@ public final class Consts {
 
   public static final String RECOVERY_DEVICE_NAME = "__RECOVERY__";
 
-  private static final Set<String> MANAGER_ROLES =
-      Collections.unmodifiableSet(new HashSet<>(Arrays.asList(ROLE_OWNER, ROLE_ADMIN)));
-
   /** Mirrors {@code IS_MANAGER_ROLE} — a role holding the {@code manage} permission. */
   public static boolean isManagerRole(String role) {
-    if (role == null
-        || !(role.equals(ROLE_OWNER)
-            || role.equals(ROLE_ADMIN)
-            || role.equals(ROLE_MEMBER)
-            || role.equals(ROLE_VIEWER)
-            || role.equals(ROLE_TEMP))) {
+    if (!Arrays.asList(ROLE_OWNER, ROLE_ADMIN, ROLE_MEMBER, ROLE_VIEWER, ROLE_TEMP).contains(role)) {
       throw new IllegalArgumentException("Invalid member role: " + role);
     }
-    return MANAGER_ROLES.contains(role);
+    return ROLE_OWNER.equals(role) || ROLE_ADMIN.equals(role);
   }
 
   // ── Key / token lengths ──

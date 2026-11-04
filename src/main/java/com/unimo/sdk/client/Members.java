@@ -36,26 +36,13 @@ public final class Members {
     }
   }
 
-  /** Private key material for a freshly provisioned member (never leaves the client). */
-  public static final class MemberSecrets {
-    public final String memberId;
-    public final CryptoPQ.KemKeyPair kemKeys;
-    public final CryptoPQ.DsaKeyPair dsaKeys;
-
-    MemberSecrets(String memberId, CryptoPQ.KemKeyPair kemKeys, CryptoPQ.DsaKeyPair dsaKeys) {
-      this.memberId = memberId;
-      this.kemKeys = kemKeys;
-      this.dsaKeys = dsaKeys;
-    }
-  }
-
   /** Public slot (goes in the manifest) + manager-only detail + secrets, for one new member. */
   public static final class MemberCredentials {
     public final Map<String, Object> memberSlot;
     public final Map<String, Object> memberEncryptedDetail;
-    public final MemberSecrets secrets;
+    public final MemberInfoBasics secrets;
 
-    MemberCredentials(Map<String, Object> memberSlot, Map<String, Object> memberEncryptedDetail, MemberSecrets secrets) {
+    MemberCredentials(Map<String, Object> memberSlot, Map<String, Object> memberEncryptedDetail, MemberInfoBasics secrets) {
       this.memberSlot = memberSlot;
       this.memberEncryptedDetail = memberEncryptedDetail;
       this.secrets = secrets;
@@ -74,32 +61,29 @@ public final class Members {
    * vault key under the KEM shared secret, and derive its memberId from the DSA public key.
    */
   public static MemberCredentials createNewCredentials(String name, String role, byte[] rootKey, byte[] initSeed) {
-    CryptoUtils.Seeds s = CryptoUtils.deriveSeeds(initSeed);
-    CryptoPQ.KemKeyPair kem = CryptoPQ.generateKemKeys(s.kemSeed);
-    CryptoPQ.Encapsulated enc = CryptoPQ.encapsulate(kem.publicKey);
+    MemberInfoBasics m = buildMember(initSeed);
+    CryptoPQ.Encapsulated enc = CryptoPQ.encapsulate(m.kemKeys.publicKey);
     byte[] wrapped = AEAD.encrypt(enc.sharedSecret, CryptoUtils.deriveKeyForRole(role, rootKey));
-    CryptoPQ.DsaKeyPair dsa = CryptoPQ.generateDsaKeys(s.dsaSeed);
-    String memberId = CryptoUtils.getMemberIdFromPubkey(dsa.publicKey);
     long ts = System.currentTimeMillis();
 
     Map<String, Object> slot =
         Json.obj(
-            "memberId", memberId,
+            "memberId", m.memberId,
             "memberRole", role,
             "memberStatus", Consts.STATUS_ACTIVE,
             "memberKemCiphertext", Helpers.base64(enc.cipherText),
             "memberVaultKeyWrapped", Helpers.base64(wrapped),
-            "memberDsaPubkey", Helpers.base64(dsa.publicKey),
+            "memberDsaPubkey", Helpers.base64(m.dsaKeys.publicKey),
             "createdAt", ts,
             "updatedAt", ts);
     Map<String, Object> detail =
         Json.obj(
-            "memberId", memberId,
+            "memberId", m.memberId,
             "memberName", name,
-            "memberKemPubkey", Helpers.base64(kem.publicKey),
-            "memberAddedBy", memberId,
+            "memberKemPubkey", Helpers.base64(m.kemKeys.publicKey),
+            "memberAddedBy", m.memberId,
             "memberAddedAt", ts);
-    return new MemberCredentials(slot, detail, new MemberSecrets(memberId, kem, dsa));
+    return new MemberCredentials(slot, detail, m);
   }
 
   /** Manager root key for the manager-only area + member list (cSHAKE of the master key). */

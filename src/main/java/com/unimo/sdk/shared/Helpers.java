@@ -1,6 +1,7 @@
 package com.unimo.sdk.shared;
 
 import com.unimo.sdk.crypto.CryptoUtils;
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.text.SimpleDateFormat;
 import java.util.Date;
@@ -53,24 +54,6 @@ public final class Helpers {
     return out;
   }
 
-  /** Encode a non-negative integer as a 4-byte big-endian array. */
-  public static byte[] u32be(long n) {
-    if (n < 0 || n > 0xffffffffL) throw new IllegalArgumentException("u32be: value out of range: " + n);
-    return new byte[] {
-      (byte) ((n >>> 24) & 0xff), (byte) ((n >>> 16) & 0xff), (byte) ((n >>> 8) & 0xff), (byte) (n & 0xff)
-    };
-  }
-
-  /** Mirror of {@code generateCanonicalJSON}. */
-  public static String generateCanonicalJSON(Object payload) {
-    return Json.canonical(payload);
-  }
-
-  /** Current epoch milliseconds (mirror of {@code now()} / {@code Date.now()}). */
-  public static long now() {
-    return System.currentTimeMillis();
-  }
-
   /** ISO-8601 UTC timestamp with millisecond precision, e.g. {@code 2026-06-05T07:43:25.123Z}.
    *  Uses {@link SimpleDateFormat} (available on every Android API level, unlike java.time).
    *  The exact format is not interop-critical — the client signs the same string it sends. */
@@ -85,6 +68,6 @@ public final class Helpers {
    * {@code chunkId = sha256( hexToBytes(fileId) || uploadNonce || u32be(chunkIndex) )}.
    */
   public static String deriveChunkId(String fileId, byte[] uploadNonce, int chunkIndex) {
-    return hex(CryptoUtils.sha256(concat(fromHex(fileId), uploadNonce, u32be(chunkIndex))));
+    return hex(CryptoUtils.sha256(concat(fromHex(fileId), uploadNonce, ByteBuffer.allocate(4).putInt(chunkIndex).array())));
   }
 }

@@ -74,7 +74,6 @@ public final class Connection {
           .build();
 
   private final String wsBase;
-  private final String path;
   private final VaultController vault;
   private final Map<String, Set<Handler>> handlers = new ConcurrentHashMap<>();
   private final Set<Runnable> openListeners = ConcurrentHashMap.newKeySet();
@@ -95,8 +94,7 @@ public final class Connection {
   private ScheduledFuture<?> reconnectTask;
 
   public Connection(String serviceUrl, VaultController vault) {
-    this.wsBase = httpToWs(serviceUrl.replaceAll("/+$", ""));
-    this.path = "/api/ws";
+    this.wsBase = serviceUrl.replaceAll("/+$", "").replaceFirst("^http", "ws"); // http(s) -> ws(s)
     this.vault = vault;
   }
 
@@ -113,10 +111,7 @@ public final class Connection {
     if (reconnectTask != null) reconnectTask.cancel(false);
     WebSocket w = this.ws;
     if (w != null) {
-      try {
-        w.close(1000, "client stop");
-      } catch (RuntimeException ignored) {
-      }
+      w.close(1000, "client stop");
       this.ws = null;
     }
     connected = false;
@@ -179,12 +174,7 @@ public final class Connection {
 
   public boolean send(Map<String, Object> msg) {
     WebSocket w = this.ws;
-    if (w == null || !connected) return false;
-    try {
-      return w.send(Json.canonical(msg));
-    } catch (RuntimeException e) {
-      return false;
-    }
+    return w != null && connected && w.send(Json.canonical(msg));
   }
 
   public boolean isOpen() {
@@ -306,11 +296,11 @@ public final class Connection {
     if (this.ws != null) return; // already connecting/connected; generation guard covers reauth races
     String token = vault.getAuthToken();
     if (token == null) { // pre-login; retry on backoff rather than waiting for an external event
-      scheduleReconnect();
+      scheduleReconnect(false);
       return;
     }
     // token (130-hex), vid/mid (64-hex) are all URL-safe — no percent-encoding needed.
-    String url = wsBase + path + "?token=" + token + "&vid=" + vault.getId() + "&mid=" + vault.getMemberId();
+    String url = wsBase + "/api/ws?token=" + token + "&vid=" + vault.getId() + "&mid=" + vault.getMemberId();
     this.ws = CLIENT.newWebSocket(new Request.Builder().url(url).build(), new Listener());
   }
 
@@ -336,10 +326,6 @@ public final class Connection {
         System.err.println("[Connection] handler error for " + type + " id=" + msg.get("id") + ": " + e);
       }
     }
-  }
-
-  private void scheduleReconnect() {
-    scheduleReconnect(false);
   }
 
   private synchronized void scheduleReconnect(boolean resetBackoff) {
@@ -386,13 +372,13 @@ public final class Connection {
                     System.err.println(
                         "[Connection] reauth keeps succeeding but the upgrade keeps failing ("
                             + reauthStreak + "x) — reconnects throttled to backoff");
-                    scheduleReconnect();
+                    scheduleReconnect(false);
                     break;
                   }
                   scheduleReconnect(true); // fresh token — reconnect promptly
                   break;
                 case TRANSIENT:
-                  scheduleReconnect(); // transient failure — retry on backoff
+                  scheduleReconnect(false); // transient failure — retry on backoff
                   break;
                 case REJECTED:
                 default:
@@ -443,10 +429,7 @@ public final class Connection {
 
     @Override
     public void onClosing(WebSocket webSocket, int code, String reason) {
-      try {
-        webSocket.close(1000, null); // complete the close handshake
-      } catch (RuntimeException ignored) {
-      }
+      webSocket.close(1000, null); // complete the close handshake
     }
 
     @Override
@@ -506,11 +489,5 @@ public final class Connection {
       }
       scheduleReconnect(System.currentTimeMillis() - openedAtMs >= RECONNECT_STABLE_MS);
     }
-  }
-
-  private static String httpToWs(String url) {
-    if (url.startsWith("https://")) return "wss://" + url.substring("https://".length());
-    if (url.startsWith("http://")) return "ws://" + url.substring("http://".length());
-    return url;
   }
 }
