@@ -78,7 +78,9 @@ public final class Client {
    * Provision a new account: an active ADMIN device + an OWNER recovery device (both wrapping the
    * same fresh master key), an account identity keypair (the vaultId), and a manager-only area
    * holding the account seed. The manifest is signed by the recovery (OWNER) device.
-   * {@code email} must have passed {@link #verifyEmailCode} within the last 15 minutes.
+   * {@code email} must have passed {@link #verifyEmailCode} within the last 15 minutes. A taken
+   * {@code accountName} fails with the {@link CodedException} code {@code NAME_TAKEN} and leaves that
+   * verification unspent: another name can be tried without a new code.
    */
   public CompletableFuture<RegisterResult> register(
       String accountName, String email, String deviceName, byte[] deviceSeed) {
