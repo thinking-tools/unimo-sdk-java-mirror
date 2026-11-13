@@ -423,7 +423,7 @@ public final class VaultController {
     if (!isManagerMember || managersKey == null) {
       throw new CodedException("Only manager members can add members", "NOT_MANAGER");
     }
-    if (!Validators.validateAccountName(memberName)) {
+    if (!Validators.validateDeviceName(memberName)) {
       throw new CodedException("Invalid member name", "INVALID_MEMBER_NAME");
     }
     String memberId = CryptoUtils.getMemberIdFromPubkey(Helpers.fromBase64(dsaPubkeyB64));

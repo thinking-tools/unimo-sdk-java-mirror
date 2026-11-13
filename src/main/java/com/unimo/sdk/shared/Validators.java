@@ -19,7 +19,8 @@ import java.util.regex.Pattern;
 public final class Validators {
   private Validators() {}
 
-  private static final Pattern ACCOUNT_NAME = Pattern.compile("^[a-zA-Z0-9_-]+$");
+  /** The characters of an account, device or collection name. */
+  private static final Pattern NAME_CHARS = Pattern.compile("^[a-zA-Z0-9_-]+$");
   private static final Pattern ACCOUNT_ID = Pattern.compile("^[a-f0-9]{64}$");
   private static final Pattern EMAIL =
       Pattern.compile("^[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*\\.[a-zA-Z]{2,}$");
@@ -41,7 +42,7 @@ public final class Validators {
           "discover",
           "everyone", "all", "none", "null", "undefined", "anonymous", "guest", "user", "test", "demo",
           "example", "sample",
-          "latticestore", "lattice-store", "lattice", "latticeapp",
+          "latticestore", "lattice-store", "lattice", "latticeapp", "unimo", "unimo-app",
           "notification", "notifications", "alert", "alerts", "message", "messages", "payment",
           "billing", "invoice", "receipt")));
 
@@ -54,7 +55,20 @@ public final class Validators {
 
   public static boolean validateAccountName(String accountName) {
     if (accountName == null || isAccountNameReserved(accountName)) return false;
-    return accountName.length() >= 5 && accountName.length() <= 256 && ACCOUNT_NAME.matcher(accountName).matches();
+    return accountName.length() >= Consts.ACCOUNT_NAME_MIN_LENGTH
+        && accountName.length() <= Consts.ACCOUNT_NAME_MAX_LENGTH
+        && NAME_CHARS.matcher(accountName).matches();
+  }
+
+  /**
+   * Device (member) names are private to the vault, so no reserved-word rules apply; only the
+   * recovery member's name is off-limits.
+   */
+  public static boolean validateDeviceName(String deviceName) {
+    if (deviceName == null || Consts.RECOVERY_DEVICE_NAME.equals(deviceName)) return false;
+    return deviceName.length() >= Consts.DEVICE_NAME_MIN_LENGTH
+        && deviceName.length() <= Consts.DEVICE_NAME_MAX_LENGTH
+        && NAME_CHARS.matcher(deviceName).matches();
   }
 
   public static boolean validateEmail(String email) {
@@ -70,7 +84,7 @@ public final class Validators {
   public static boolean isValidCollectionName(String name) {
     if (name == null) return false;
     String t = name.trim();
-    return t.length() >= 1 && t.length() <= 64 && ACCOUNT_NAME.matcher(t).matches();
+    return t.length() >= 1 && t.length() <= 64 && NAME_CHARS.matcher(t).matches();
   }
 
   public static boolean isValidCollectionType(String type) {

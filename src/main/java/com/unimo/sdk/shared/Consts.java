@@ -28,6 +28,12 @@ public final class Consts {
 
   public static final String RECOVERY_DEVICE_NAME = "__RECOVERY__";
 
+  // ── Name lengths (VALIDATION_RULES.accountName / .deviceName) ──
+  public static final int ACCOUNT_NAME_MIN_LENGTH = 5;
+  public static final int ACCOUNT_NAME_MAX_LENGTH = 256;
+  public static final int DEVICE_NAME_MIN_LENGTH = 5;
+  public static final int DEVICE_NAME_MAX_LENGTH = 48;
+
   /** Mirrors {@code IS_MANAGER_ROLE} — a role holding the {@code manage} permission. */
   public static boolean isManagerRole(String role) {
     if (!Arrays.asList(ROLE_OWNER, ROLE_ADMIN, ROLE_MEMBER, ROLE_VIEWER, ROLE_TEMP).contains(role)) {
