@@ -14,6 +14,14 @@ import java.util.Set;
  * are JSON-compatible ({@code String}, {@code Long}, {@code Double}, {@code Boolean}, nested
  * {@code Map}/{@code List}, or null). Local edits accumulate in {@code pending} until the owning
  * {@link CollectionController} persists them. The reactive {@link #data} drives UI bindings.
+ *
+ * <p>Threads (Java only; the TS original has one): the app's thread, the save timer and the network
+ * threads all come here, so every method holds this object's lock. Listeners of {@link #data} run
+ * under that lock, on the thread that made the change: they must not block, and must not take a
+ * lock that is ever held while calling in here (so never wait there for a save or a pull).
+ * {@code set} and {@code delete} change the map inside {@link #data} in place: a copy per edit would
+ * make a bulk sync quadratic. So read that map only through these methods or on the one thread that
+ * writes, and a listener that hands it to another thread must hand over a copy.
  */
 public final class KVContent {
   public final ReactiveValue<Map<String, Object>> data = new ReactiveValue<>(new LinkedHashMap<>());
@@ -43,21 +51,21 @@ public final class KVContent {
   }
 
   /** Serialize the map to a JSON object (UTF-8). Order-free: the blob is parsed, never hashed. */
-  public byte[] serialize() {
+  public synchronized byte[] serialize() {
     return Helpers.utf8(Json.canonical(data.get()));
   }
 
-  public Object get(String key) {
+  public synchronized Object get(String key) {
     return data.get().get(key);
   }
 
-  public void set(String key, Object value) {
+  public synchronized void set(String key, Object value) {
     validateKey(key);
     pending.put(key, new Pending(false, value));
     data.update(m -> m.put(key, value));
   }
 
-  public boolean delete(String key) {
+  public synchronized boolean delete(String key) {
     boolean had = data.get().containsKey(key);
     if (had) {
       pending.put(key, new Pending(true, null));
@@ -66,11 +74,11 @@ public final class KVContent {
     return had;
   }
 
-  public boolean has(String key) {
+  public synchronized boolean has(String key) {
     return data.get().containsKey(key);
   }
 
-  public Set<String> keys() {
+  public synchronized Set<String> keys() {
     return new LinkedHashMap<>(data.get()).keySet();
   }
 
@@ -79,7 +87,7 @@ public final class KVContent {
    * the base, not a union with the local map: a key another device deleted must not survive here,
    * or this device's next save re-uploads it.
    */
-  public void merge(KVContent remote) {
+  public synchronized void merge(KVContent remote) {
     Map<String, Object> merged = new LinkedHashMap<>(remote.data.get());
     for (Map.Entry<String, Pending> e : pending.entrySet()) {
       if (e.getValue().delete) merged.remove(e.getKey());
@@ -89,7 +97,7 @@ public final class KVContent {
   }
 
   /** Non-null (a snapshot of pending edits) when there are unsaved changes, else null. */
-  public Map<String, Object> getPendingChanges() {
+  public synchronized Map<String, Object> getPendingChanges() {
     if (pending.isEmpty()) return null;
     Map<String, Object> out = new LinkedHashMap<>();
     for (Map.Entry<String, Pending> e : pending.entrySet()) out.put(e.getKey(), e.getValue().value);
@@ -97,7 +105,7 @@ public final class KVContent {
   }
 
   /** The pending ops as opaque tokens, taken before a save serializes (see {@link #clearPending}). */
-  public Map<String, Object> pendingSnapshot() {
+  public synchronized Map<String, Object> pendingSnapshot() {
     return new LinkedHashMap<>(pending);
   }
 
@@ -105,7 +113,7 @@ public final class KVContent {
    * Forget the ops in {@code uploaded} (a save's {@link #pendingSnapshot}). An op set or deleted
    * during the upload is a different object and stays pending, like sdk-ts {@code clearPending}.
    */
-  public void clearPending(Map<String, Object> uploaded) {
+  public synchronized void clearPending(Map<String, Object> uploaded) {
     for (Map.Entry<String, Object> e : uploaded.entrySet()) pending.remove(e.getKey(), e.getValue());
   }
 

@@ -539,11 +539,20 @@ public final class VaultController {
       throw new CodedException("Only manager members can create collections", "NOT_MANAGER");
     }
     CollectionController col = CollectionController.createNew(name, type, this, activeMember.memberId);
-    collections.update(list -> list.add(col));
+    // A new list, never an edit in place: other threads iterate the one they hold.
+    List<CollectionController> grown = new ArrayList<>(collections.get());
+    grown.add(col);
+    collections.set(grown);
     return tasker
         .upload(this, col.getId(), col.serialize(), col.getEncKey(), 0)
         .thenCompose(
             up -> {
+              if (!collections.get().contains(col)) {
+                // The list was replaced while the blob went up (a logout, a manifest from another device):
+                // a manifest written now would not list this collection, and nothing would ever dispose it.
+                col.dispose();
+                throw new CodedException("Collection list changed while creating", "CREATE_ABANDONED");
+              }
               col.setInitialVersion(up.version);
               col.attachTasker(tasker, true);
               encryptAndUpdateCollectionsList();
@@ -574,8 +583,7 @@ public final class VaultController {
     if (!isManagerMember || collectionsKey == null) {
       throw new CodedException("Only manager members can remove collections", "NOT_MANAGER");
     }
-    CollectionController col = findCollection(colId);
-    if (col != null) col.dispose();
+    CollectionController removed = findCollection(colId);
     // Soft-delete via Tasker (reauth-on-401). A blob already gone (NOT_FOUND) or already trashed
     // (TRASHED) still gets pruned from the manifest.
     return tasker
@@ -587,8 +595,14 @@ public final class VaultController {
             })
         .thenCompose(
             x -> {
+              // Disposed only now that it is gone: a collection whose delete failed stays in the list and must still save.
+              // Both the one that was listed when this began and whatever a manifest refresh put in its place since.
+              if (removed != null) removed.dispose();
               List<CollectionController> kept = new ArrayList<>();
-              for (CollectionController c : collections.get()) if (!colId.equals(c.getId())) kept.add(c);
+              for (CollectionController c : collections.get()) {
+                if (colId.equals(c.getId())) c.dispose();
+                else kept.add(c);
+              }
               collections.set(kept);
               encryptAndUpdateCollectionsList();
               return saveUpdate();
@@ -601,6 +615,25 @@ public final class VaultController {
     if (!(t instanceof CodedException)) return false;
     String code = ((CodedException) t).getCode();
     return "NOT_FOUND".equals(code) || "TRASHED".equals(code);
+  }
+
+  /**
+   * The end of the collections this vault has handed out (see {@link CollectionController#dispose}):
+   * none of them saves or pulls again. The vault itself stays usable: whoever asks next gets
+   * collections loaded afresh.
+   */
+  public void disposeCollections() {
+    List<CollectionController> ended = collections.get();
+    List<CollectionController> fresh;
+    try {
+      fresh = decryptCollectionsList();
+    } catch (RuntimeException unreadable) {
+      // A device being removed may hold a manifest its keys no longer open. Logout must still go through:
+      // the list is refilled by the next manifest refresh that can be read.
+      fresh = new ArrayList<>();
+    }
+    collections.set(fresh);
+    for (CollectionController c : ended) c.dispose();
   }
 
   private CollectionController findCollection(String colId) {

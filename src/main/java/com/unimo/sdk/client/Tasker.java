@@ -90,7 +90,7 @@ public final class Tasker {
     public final long totalBytes;
     public final int chunkCount;
 
-    UploadResult(int version, String etag, long totalBytes, int chunkCount) {
+    public UploadResult(int version, String etag, long totalBytes, int chunkCount) {
       this.version = version;
       this.etag = etag;
       this.totalBytes = totalBytes;
@@ -103,7 +103,7 @@ public final class Tasker {
     public final byte[] data;
     public final int version;
 
-    DownloadResult(String etag, byte[] data, int version) {
+    public DownloadResult(String etag, byte[] data, int version) {
       this.etag = etag;
       this.data = data;
       this.version = version;
@@ -177,6 +177,11 @@ public final class Tasker {
   /** Package-private seam for tests (a VaultController needs a live login). */
   VaultWatch hook(String vaultId, Watch manifest) {
     return watches.computeIfAbsent(vaultId, id -> new VaultWatch(manifest));
+  }
+
+  /** Whether a live connection drives the watches here; without one {@link #watchCollection} does nothing. */
+  public boolean isLive() {
+    return connection != null;
   }
 
   /** Route {@code colId}'s change frames (and the reconnect catch-up) to {@code watch}, replacing

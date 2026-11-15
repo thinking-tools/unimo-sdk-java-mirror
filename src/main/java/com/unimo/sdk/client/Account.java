@@ -1,5 +1,6 @@
 package com.unimo.sdk.client;
 
+import com.unimo.sdk.crypto.CodedException;
 import com.unimo.sdk.client.collections.CollectionController;
 import com.unimo.sdk.client.collections.KVContent;
 import java.util.List;
@@ -18,6 +19,7 @@ import java.util.function.Consumer;
  * #onRevoked} tells the app when the gateway no longer accepts this device.
  */
 public final class Account {
+  private volatile boolean destroyed;
   private final String serviceUrl;
   private final VaultController vault;
   private final Tasker tasker;
@@ -110,11 +112,20 @@ public final class Account {
   }
 
   public CompletableFuture<KVContent> createNewCollection(String name, String type) {
+    if (destroyed) return destroyed();
     return vault.createCollection(name, type, tasker);
   }
 
   public CompletableFuture<KVContent> getCollection(String name) {
+    if (destroyed) return destroyed();
     return vault.getCollectionByName(tasker, name);
+  }
+
+  /** After {@link #destroy}: nothing is read or written through this account any more. */
+  private static <T> CompletableFuture<T> destroyed() {
+    CompletableFuture<T> refused = new CompletableFuture<>();
+    refused.completeExceptionally(new CodedException("Account destroyed", "DESTROYED"));
+    return refused;
   }
 
   // ── members + invites ──
@@ -162,7 +173,14 @@ public final class Account {
     return connection != null ? connection.on("vault:event", handler) : () -> {};
   }
 
+  /**
+   * Logout: the socket closes, every collection handed out is disposed (a save still queued for one
+   * never uploads, and a later one fails as {@code DISPOSED}), and this account gives out no more.
+   * Flush what must be kept before calling this.
+   */
   public void destroy() {
+    destroyed = true;
     if (connection != null) connection.stop();
+    vault.disposeCollections();
   }
 }
