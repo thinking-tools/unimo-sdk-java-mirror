@@ -9,6 +9,7 @@ import com.unimo.sdk.shared.Json;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -18,6 +19,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
+import java.util.function.LongConsumer;
 import java.util.function.Supplier;
 
 /**
@@ -27,7 +29,8 @@ import java.util.function.Supplier;
  *
  * <ul>
  *   <li>Single-chunk (≤ {@link Consts#CHUNK_SIZE}): AEAD-encrypt → CAS head PUT.
- *   <li>Multi-chunk: HEAD probe → parallel chunk PUTs → encrypted head-blob commit.
+ *   <li>Multi-chunk: HEAD probe → parallel chunk PUTs under the version it names → encrypted
+ *       head-blob commit naming that version.
  *   <li>Download: GET head; if {@code chunkCount>0}, decrypt the head-blob JSON, parallel chunk
  *       GETs, concat.
  * </ul>
@@ -37,6 +40,8 @@ import java.util.function.Supplier;
  */
 public final class Tasker {
   private static final int MAX_CAS_RETRIES = 5;
+  private static final int MAX_BUSY_RETRIES = 3;
+  private static final long MAX_BUSY_WAIT_MS = 5_000;
   private static final String OCTET = "application/octet-stream";
   private static final ExecutorService POOL =
       Executors.newCachedThreadPool(
@@ -131,7 +136,8 @@ public final class Tasker {
   }
 
   /** Upload encrypted bytes under {@code fileId}. {@code expectedVersion} CAS-pins the current
-   *  head (use {@code 0} to assert first-write); {@code null} HEAD-probes for multi-chunk. */
+   *  head (use {@code 0} to assert first-write): when the head is another version the upload fails
+   *  with {@code VERSION_MISMATCH} and nothing is committed. {@code null}: the last writer wins. */
   public CompletableFuture<UploadResult> upload(
       VaultController v, String fileId, byte[] data, byte[] encKey, Integer expectedVersion) {
     return CompletableFuture.supplyAsync(
@@ -152,7 +158,7 @@ public final class Tasker {
 
   /** Current server version of {@code fileId} via a body-less HEAD ({@code 0} when it has none). */
   public CompletableFuture<Integer> probeVersion(VaultController v, String fileId) {
-    return CompletableFuture.supplyAsync(() -> headProbe(v, fileId), POOL);
+    return CompletableFuture.supplyAsync(() -> headProbe(v, fileId).head, POOL);
   }
 
   // ── WS watch plane (port of the TS Tasker hookVault / watchCollection) ──
@@ -278,32 +284,38 @@ public final class Tasker {
   private UploadResult singleChunkUpload(
       VaultController v, String fileId, byte[] data, byte[] encKey, Integer expectedVersion) {
     byte[] ciphertext = AEAD.encrypt(encKey, data);
-    ApiClient.ApiResponse r = commitHead(v, fileId, ciphertext, 0, expectedVersion);
+    ApiClient.ApiResponse r = commit(v, fileId, ciphertext, singleChunkCommitHeaders(expectedVersion));
     if (r.status == 201) {
       Map<String, Object> j = r.jsonObject();
       return new UploadResult(((Number) j.get("version")).intValue(), (String) j.get("etag"), data.length, 0);
     }
     if (r.status == 412) {
-      // 412 VERSION_MISMATCH: the remote head moved since the caller pinned expectedVersion (or
-      // expectedVersion=0 asserted first-write but an object already exists). Re-committing the
-      // same ciphertext over the new head would silently clobber the concurrent writer, so
-      // surface the conflict for the caller to pull + merge + retry (CollectionController.save
-      // branches on a "CAS"/"VERSION_MISMATCH" message). A commit with no expectedVersion can
-      // never 412 — the server skips CAS — so this only ever fires on a real pinned conflict.
+      // A commit with no expectedVersion can never 412 — the server skips CAS — so this only ever
+      // fires on a real pinned conflict.
       Object cur;
       try {
         cur = r.jsonObject().get("currentHead");
       } catch (RuntimeException e) {
         cur = null;
       }
-      throw new CodedException(
-          "CAS VERSION_MISMATCH: expected version " + expectedVersion + ", remote head "
-              + (cur instanceof Number ? cur : "unknown"),
-          "VERSION_MISMATCH");
+      throw casMismatch(expectedVersion, cur);
     }
     if (r.status == 401) throw new CodedException("Unauthorized", "UNAUTHORIZED");
     if (r.status == 409) throw new CodedException("File is trashed", "TRASHED");
     throw new CodedException("head PUT failed: " + r.status, "HEAD_PUT_FAILED");
+  }
+
+  /**
+   * The remote head is not the version the caller pinned (or {@code expectedVersion=0} asserted a
+   * first write and the file exists). Committing over it would silently clobber the other writer,
+   * so the conflict goes to the caller to pull + merge + retry (CollectionController.save branches
+   * on a "CAS"/"VERSION_MISMATCH" message).
+   */
+  private static CodedException casMismatch(Integer expectedVersion, Object remoteHead) {
+    return new CodedException(
+        "CAS VERSION_MISMATCH: expected version " + expectedVersion + ", remote head "
+            + (remoteHead instanceof Number ? remoteHead : "unknown"),
+        "VERSION_MISMATCH");
   }
 
   private UploadResult multiChunkUpload(
@@ -314,8 +326,12 @@ public final class Tasker {
           "File exceeds " + Consts.STORAGE_MAX_CHUNKS_PER_FILE + " chunks", "TOO_MANY_CHUNKS");
     }
     for (int attempt = 0; attempt < MAX_CAS_RETRIES; attempt++) {
-      int currentHead = (attempt == 0 && expectedVersion != null) ? expectedVersion : headProbe(v, fileId);
-      int predictedVersion = currentHead + 1;
+      // The caller's pin holds on every attempt: a head that is not the pinned version is a
+      // conflict, known before a chunk is uploaded.
+      Probe probe = headProbe(v, fileId);
+      if (expectedVersion != null && expectedVersion.intValue() != probe.head) {
+        throw casMismatch(expectedVersion, probe.head);
+      }
       byte[] uploadNonce = CryptoUtils.generateRandomBytes(Consts.UPLOAD_NONCE_BYTES);
 
       AtomicBoolean stale = new AtomicBoolean(false);
@@ -325,7 +341,7 @@ public final class Tasker {
         int end = Math.min(start + Consts.CHUNK_SIZE, data.length);
         byte[] ct = AEAD.encrypt(encKey, Arrays.copyOfRange(data, start, end));
         String chunkId = Helpers.deriveChunkId(fileId, uploadNonce, i);
-        String url = chunkUrl(v, fileId, predictedVersion, chunkId);
+        String url = chunkUrl(v, fileId, probe.nextVersion, chunkId);
         puts.add(
             authedSend(v, "PUT", url, ct, Collections.emptyMap())
                 .thenAccept(
@@ -340,18 +356,19 @@ public final class Tasker {
                     }));
       }
       CompletableFuture.allOf(puts.toArray(new CompletableFuture[0])).join();
-      if (stale.get()) continue; // some chunk saw a stale head — retry with a fresh probe
+      if (stale.get()) continue; // no commit can be issued that version any more — probe again
 
       Map<String, Object> headBlob =
           Json.obj("v", Consts.HEAD_BLOB_SCHEMA_VERSION, "nonce", Helpers.hex(uploadNonce), "count", totalChunks, "size", data.length);
       byte[] headCiphertext = AEAD.encrypt(encKey, Helpers.utf8(Json.canonical(headBlob)));
-      ApiClient.ApiResponse commit = commitHead(v, fileId, headCiphertext, totalChunks, currentHead);
+      ApiClient.ApiResponse commit =
+          commit(v, fileId, headCiphertext, multiChunkCommitHeaders(totalChunks, probe));
       if (commit.status == 201) {
         Map<String, Object> j = commit.jsonObject();
         return new UploadResult(((Number) j.get("version")).intValue(), (String) j.get("etag"), data.length, totalChunks);
       }
       if (commit.status != 412) throw new CodedException("head commit failed: " + commit.status, "HEAD_PUT_FAILED");
-      // 412 → loop and retry with a fresh head
+      // 412: the head moved, or the commit would not be issued probe.nextVersion → probe again
     }
     throw new CodedException("Multi-chunk upload CAS failed after retries", "CAS_FAILED");
   }
@@ -422,20 +439,83 @@ public final class Tasker {
             });
   }
 
-  private ApiClient.ApiResponse commitHead(
-      VaultController v, String fileId, byte[] body, int chunkCount, Integer expectedVersion) {
-    Map<String, String> h = new java.util.HashMap<>();
-    h.put(Consts.HEADER_CHUNK_COUNT, String.valueOf(chunkCount));
-    if (expectedVersion != null) h.put(Consts.HEADER_EXPECTED_VERSION, String.valueOf(expectedVersion));
-    return authedSend(v, "PUT", fileUrl(v, fileId), body, h).join();
+  private ApiClient.ApiResponse commit(VaultController v, String fileId, byte[] body, Map<String, String> headers) {
+    return retryWhileBusy(() -> authedSend(v, "PUT", fileUrl(v, fileId), body, headers).join(), Tasker::sleep);
   }
 
-  private int headProbe(VaultController v, String fileId) {
-    ApiClient.ApiResponse r = authedSend(v, "HEAD", fileUrl(v, fileId), null, Collections.emptyMap()).join();
-    if (r.status == 404) return 0;
-    if (r.status == 410) throw new CodedException("File is trashed", "TRASHED");
-    if (!r.ok()) throw new CodedException("HEAD failed: " + r.status, "HEAD_FAILED");
-    return headerInt(r, Consts.HEADER_STORAGE_VERSION, 0);
+  /**
+   * Pure retry policy for 503 {@code BUSY}: another write to the same file was still running when
+   * the gateway gave up waiting for it. Nothing was done, so the same request goes again after
+   * {@code Retry-After} — a head commit that failed here would throw away every chunk already
+   * uploaded. {@code sleep} blocks the calling (upload worker) thread.
+   */
+  static ApiClient.ApiResponse retryWhileBusy(Supplier<ApiClient.ApiResponse> send, LongConsumer sleep) {
+    for (int retry = 0; ; retry++) {
+      ApiClient.ApiResponse r = send.get();
+      if (retry == MAX_BUSY_RETRIES || !isBusy(r)) return r;
+      sleep.accept(Math.min(headerInt(r, "retry-after", 1) * 1000L, MAX_BUSY_WAIT_MS));
+    }
+  }
+
+  private static boolean isBusy(ApiClient.ApiResponse r) {
+    if (r.status != 503) return false;
+    try {
+      return "BUSY".equals(r.jsonObject().get("code"));
+    } catch (RuntimeException e) {
+      return false; // not the gateway's JSON: some other 503
+    }
+  }
+
+  private static void sleep(long ms) {
+    try {
+      Thread.sleep(ms);
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      throw new CodedException("Upload interrupted", "INTERRUPTED", e);
+    }
+  }
+
+  static Map<String, String> singleChunkCommitHeaders(Integer expectedVersion) {
+    Map<String, String> h = new HashMap<>();
+    h.put(Consts.HEADER_CHUNK_COUNT, "0");
+    if (expectedVersion != null) h.put(Consts.HEADER_EXPECTED_VERSION, String.valueOf(expectedVersion));
+    return h;
+  }
+
+  /** A multi-chunk head replaces {@code probe.head} and lands at {@code probe.nextVersion}, the
+   *  version directory its chunks are under: the gateway commits it there or answers 412. */
+  static Map<String, String> multiChunkCommitHeaders(int chunkCount, Probe probe) {
+    Map<String, String> h = new HashMap<>();
+    h.put(Consts.HEADER_CHUNK_COUNT, String.valueOf(chunkCount));
+    h.put(Consts.HEADER_CHUNK_VERSION, String.valueOf(probe.nextVersion));
+    h.put(Consts.HEADER_EXPECTED_VERSION, String.valueOf(probe.head));
+    return h;
+  }
+
+  /**
+   * What a body-less HEAD says about a file: its head version ({@code 0} when it has none yet) and
+   * the version its next commit is issued. That is past {@code head + 1} once a commit failed after
+   * the gateway took its version; a gateway that does not name it issues {@code head + 1}.
+   */
+  static final class Probe {
+    final int head;
+    final int nextVersion;
+
+    private Probe(int head, int nextVersion) {
+      this.head = head;
+      this.nextVersion = nextVersion;
+    }
+
+    static Probe of(ApiClient.ApiResponse r) {
+      if (r.status == 410) throw new CodedException("File is trashed", "TRASHED");
+      if (!r.ok() && r.status != 404) throw new CodedException("HEAD failed: " + r.status, "HEAD_FAILED");
+      int head = headerInt(r, Consts.HEADER_STORAGE_VERSION, 0); // 404: no version yet
+      return new Probe(head, headerInt(r, Consts.HEADER_STORAGE_NEXT_VERSION, head + 1));
+    }
+  }
+
+  private Probe headProbe(VaultController v, String fileId) {
+    return Probe.of(authedSend(v, "HEAD", fileUrl(v, fileId), null, Collections.emptyMap()).join());
   }
 
   private Map<String, String> authHeaders(VaultController v) {

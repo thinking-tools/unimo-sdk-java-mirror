@@ -81,7 +81,11 @@ public final class Consts {
 
   public static final String HEADER_EXPECTED_VERSION = "x-expected-version";
   public static final String HEADER_CHUNK_COUNT = "x-chunk-count";
+  /** On a multi-chunk commit: the version directory its chunks were uploaded under. */
+  public static final String HEADER_CHUNK_VERSION = "x-chunk-version";
   public static final String HEADER_STORAGE_VERSION = "x-storage-version";
+  /** On a HEAD response: the version the file's next commit is issued. */
+  public static final String HEADER_STORAGE_NEXT_VERSION = "x-storage-next-version";
   public static final String HEADER_STORAGE_ENDPOINT = "x-storage-endpoint";
 
   public static final int KV_KEY_SIZE_LIMIT_BYTES = 64;
