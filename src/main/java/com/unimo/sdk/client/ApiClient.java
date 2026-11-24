@@ -1,6 +1,7 @@
 package com.unimo.sdk.client;
 
 import com.unimo.sdk.crypto.CodedException;
+import com.unimo.sdk.shared.Consts;
 import com.unimo.sdk.shared.Helpers;
 import com.unimo.sdk.shared.Json;
 import java.io.IOException;
@@ -26,6 +27,21 @@ import okhttp3.Response;
  * {@link #authRequest} is non-throwing so callers can branch on 401 for token refresh.
  */
 public final class ApiClient {
+  /** True once the gateway has refused this build's API version: nothing will work until the app
+   *  is updated, so the app shows its "update required" notice. It stays true, as the build cannot
+   *  change while it runs. */
+  public static final ReactiveValue<Boolean> UPGRADE_REQUIRED = new ReactiveValue<>(false);
+
+  /** Every gateway answer passes through here, the WebSocket upgrade's included. The gateway names
+   *  its minimum version only when refusing, so another 426 on the path is not taken for one.
+   *  Synchronized to set once: {@code set} notifies every time, and from here on every request is
+   *  refused. */
+  static synchronized void noteRefusal(Response response) {
+    if (response.header(Consts.HEADER_MIN_API_VERSION) != null && !UPGRADE_REQUIRED.get()) {
+      UPGRADE_REQUIRED.set(true);
+    }
+  }
+
   private static final OkHttpClient CLIENT =
       new OkHttpClient.Builder()
           .connectTimeout(15, TimeUnit.SECONDS)
@@ -78,6 +94,7 @@ public final class ApiClient {
       String method, String url, byte[] body, String contentType, Map<String, String> headers) {
     Request.Builder rb = new Request.Builder().url(url);
     for (Map.Entry<String, String> h : headers.entrySet()) rb.header(h.getKey(), h.getValue());
+    rb.header(Consts.HEADER_API_VERSION, String.valueOf(Consts.API_VERSION));
     RequestBody reqBody = body == null ? null : RequestBody.create(body, MediaType.get(contentType));
     switch (method) {
       case "GET":
@@ -112,6 +129,7 @@ public final class ApiClient {
               @Override
               public void onResponse(Call call, Response response) {
                 try (Response r = response) {
+                  noteRefusal(r);
                   byte[] b = r.body() != null ? r.body().bytes() : new byte[0];
                   Map<String, String> hs = new HashMap<>();
                   for (Map.Entry<String, List<String>> e : r.headers().toMultimap().entrySet()) {

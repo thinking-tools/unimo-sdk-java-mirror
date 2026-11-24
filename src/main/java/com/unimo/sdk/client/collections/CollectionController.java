@@ -462,6 +462,13 @@ public final class CollectionController {
     }
   }
 
+  /** The name the manifest lists this collection under: another device renamed it, or a rename here was not taken. */
+  public void adoptName(String listedName) {
+    synchronized (lock) {
+      this.colName = listedName;
+    }
+  }
+
   /** Minimal descriptor stored (encrypted) in the manifest's collections list. */
   public Map<String, Object> minimalMap() {
     return Json.obj("colId", colId, "colType", colType, "colName", getName(), "colEncKey", Helpers.base64(colEncKey));

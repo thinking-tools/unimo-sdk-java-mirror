@@ -79,6 +79,15 @@ public final class Consts {
   public static final int UPLOAD_NONCE_BYTES = 16;
   public static final int HEAD_BLOB_SCHEMA_VERSION = 1;
 
+  /** API version this SDK speaks, stated on every gateway request. Bumped only by a breaking
+   *  change: the gateway refuses a version it no longer serves. */
+  public static final int API_VERSION = 1;
+  public static final String HEADER_API_VERSION = "x-api-version";
+  /** The same version on the WebSocket upgrade, whose URL carries the credentials too. */
+  public static final String QUERY_API_VERSION = "api";
+  /** On a refusal only: the oldest API version the gateway serves. */
+  public static final String HEADER_MIN_API_VERSION = "x-min-api-version";
+
   public static final String HEADER_EXPECTED_VERSION = "x-expected-version";
   public static final String HEADER_CHUNK_COUNT = "x-chunk-count";
   /** On a multi-chunk commit: the version directory its chunks were uploaded under. */

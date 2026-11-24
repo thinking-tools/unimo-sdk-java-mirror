@@ -171,13 +171,13 @@ public final class Tasker {
    */
   public void hookVault(VaultController v) {
     if (connection == null) return;
+    v.onAdopted = () -> announce(null);
     hook(
         v.getId(),
-        known -> {
-          int before = v.getManifestVersion();
-          if (known != null && known <= before) return CompletableFuture.completedFuture(false);
-          return v.timeToFetchUpdate().thenApply(x -> v.getManifestVersion() != before);
-        });
+        known ->
+            known != null && known <= v.getManifestVersion()
+                ? CompletableFuture.completedFuture(false)
+                : v.timeToFetchUpdate());
   }
 
   /** Package-private seam for tests (a VaultController needs a live login). */
@@ -205,7 +205,7 @@ public final class Tasker {
 
   /** Run {@code listener} (on an SDK thread) whenever a watch merged newer remote state: with the
    *  collection's id for a watched collection's content, with null for the manifest (members, the
-   *  collections list). */
+   *  collections list). For the manifest it runs inside the vault's update: see {@link Account#onRemoteChange}. */
   public ReactiveValue.Subscription onRemoteChange(Consumer<String> listener) {
     remoteChangeListeners.add(listener);
     return () -> remoteChangeListeners.remove(listener);
@@ -254,15 +254,19 @@ public final class Tasker {
             System.err.println("[Tasker] watch refresh failed: " + err);
             return;
           }
-          if (!Boolean.TRUE.equals(changed)) return;
-          for (Consumer<String> l : remoteChangeListeners) {
-            try {
-              l.accept(fileId);
-            } catch (RuntimeException e) {
-              System.err.println("[Tasker] remote-change listener error: " + e);
-            }
-          }
+          if (Boolean.TRUE.equals(changed)) announce(fileId);
         });
+  }
+
+  /** Tell the {@link #onRemoteChange} listeners that newer remote state was merged. */
+  private void announce(String fileId) {
+    for (Consumer<String> l : remoteChangeListeners) {
+      try {
+        l.accept(fileId);
+      } catch (RuntimeException e) {
+        System.err.println("[Tasker] remote-change listener error: " + e);
+      }
+    }
   }
 
   /** Soft-delete {@code fileId}: every version moves to trash and stays restorable until

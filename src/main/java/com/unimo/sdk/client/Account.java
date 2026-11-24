@@ -150,7 +150,9 @@ public final class Account {
    * {@code vault:event} push or the catch-up after every WebSocket reconnect. It receives the
    * collection's name for a loaded collection's content (collections are watched once loaded via
    * {@link #getCollection}), or null for the manifest (members, collections list — a collection
-   * another device just created shows up here). Never fires when keepAlive=false.
+   * another device just created shows up here). Never fires when keepAlive=false. For the manifest
+   * it runs inside the vault's update, so it must hand off anything that waits for a member,
+   * invite or collection-list change of this account.
    */
   public ReactiveValue.Subscription onRemoteChange(Consumer<String> listener) {
     return tasker.onRemoteChange(

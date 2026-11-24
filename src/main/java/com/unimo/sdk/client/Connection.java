@@ -1,6 +1,7 @@
 package com.unimo.sdk.client;
 
 import com.unimo.sdk.crypto.CodedException;
+import com.unimo.sdk.shared.Consts;
 import com.unimo.sdk.shared.Json;
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -23,7 +24,8 @@ import okhttp3.WebSocketListener;
  * Port of {@code sdk/ts/src_ts/client/Connection.ts} — a long-lived authenticated WebSocket per
  * vault, over OkHttp. The gateway pushes {@code vault:event} frames (blob put / trash / restore /
  * head change / presence / member revoked / invite claimed / subscription changed). Credentials
- * ride the URL query (the upgrade can't set headers): {@code wss://host/api/ws?token=&vid=&mid=}.
+ * and the API version ride the URL query (the upgrade can't set headers): {@code
+ * wss://host/api/ws?token=&vid=&mid=&api=}.
  *
  * <p>Recovery is layered. A dropped or dead connection retries on exponential backoff (250ms →
  * 30s cap, with jitter — matching the TS original), and client pings make silent network loss
@@ -39,6 +41,11 @@ import okhttp3.WebSocketListener;
  * VaultController#reauth()}. On success the connection reopens with the fresh token
  * (streak-capped so a token the gateway keeps rejecting can't loop unthrottled), a transient
  * failure keeps backing off, and a definitive rejection (404/401/403) halts the chain.
+ *
+ * <p>The token: the gateway checks it only when the socket opens, and it lasts 2 hours whether used
+ * or not, so an open socket outlives its token. The connection therefore has it refreshed once it
+ * is 90 minutes old (see {@link #isTokenDue}). Without that the first HTTP request after 2 hours
+ * meets a 401: the SDK's own requests recover from one, requests the app sends with the token do not.
  */
 public final class Connection {
   public interface Handler {
@@ -52,6 +59,10 @@ public final class Connection {
   private static final long RECONNECT_CAP_MS = 30_000;
   /** A socket open at least this long counts as "stable" — its close resets the backoff counter. */
   private static final long RECONNECT_STABLE_MS = 30_000;
+  /** How long a token is used on an open socket before it is refreshed: well inside the gateway's 2 hours. */
+  private static final long TOKEN_REFRESH_MS = TimeUnit.MINUTES.toMillis(90);
+  /** How often an open socket's token is looked at: as often as the socket is pinged. */
+  private static final long TOKEN_CHECK_MS = 20_000;
   /** Backs the {@link WsRequest} per-request timeouts and the reconnect schedule. */
   private static final ScheduledExecutorService SCHED =
       Executors.newScheduledThreadPool(
@@ -92,6 +103,10 @@ public final class Connection {
   /** Backoff attempt counter — guarded by {@code this} (scheduleReconnect's lock). */
   private int reconnectAttempt;
   private ScheduledFuture<?> reconnectTask;
+  /** When the token in use was issued, as far as this connection knows: at start (right after the
+   *  login) and at each refresh it asked for. Wall-clock, so time spent suspended counts. */
+  private volatile long tokenSinceMs;
+  private ScheduledFuture<?> tokenCheck;
 
   public Connection(String serviceUrl, VaultController vault) {
     this.wsBase = serviceUrl.replaceAll("/+$", "").replaceFirst("^http", "ws"); // http(s) -> ws(s)
@@ -102,6 +117,10 @@ public final class Connection {
     stopped = false;
     generation++; // invalidate any in-flight reauth from a prior connection
     reauthStreak = 0; // fresh start = fresh intent
+    tokenSinceMs = System.currentTimeMillis();
+    if (tokenCheck != null) tokenCheck.cancel(false);
+    tokenCheck =
+        SCHED.scheduleWithFixedDelay(this::refreshOldToken, TOKEN_CHECK_MS, TOKEN_CHECK_MS, TimeUnit.MILLISECONDS);
     open();
   }
 
@@ -109,6 +128,7 @@ public final class Connection {
     stopped = true;
     generation++; // any in-flight reauth must not reopen on the restarted connection
     if (reconnectTask != null) reconnectTask.cancel(false);
+    if (tokenCheck != null) tokenCheck.cancel(false);
     WebSocket w = this.ws;
     if (w != null) {
       w.close(1000, "client stop");
@@ -300,7 +320,9 @@ public final class Connection {
       return;
     }
     // token (130-hex), vid/mid (64-hex) are all URL-safe — no percent-encoding needed.
-    String url = wsBase + "/api/ws?token=" + token + "&vid=" + vault.getId() + "&mid=" + vault.getMemberId();
+    String url =
+        wsBase + "/api/ws?token=" + token + "&vid=" + vault.getId() + "&mid=" + vault.getMemberId()
+            + "&" + Consts.QUERY_API_VERSION + "=" + Consts.API_VERSION;
     this.ws = CLIENT.newWebSocket(new Request.Builder().url(url).build(), new Listener());
   }
 
@@ -359,8 +381,7 @@ public final class Connection {
    */
   private void runReauthThenReconnect() {
     final int gen = generation;
-    vault
-        .reauth()
+    refreshToken()
         .whenComplete(
             (outcome, err) -> {
               if (stopped || gen != generation) return;
@@ -388,6 +409,28 @@ public final class Connection {
                   break;
               }
             });
+  }
+
+  /** Has the vault refresh the token (single-flight). A fresh one, or a refusal for good, is not
+   *  asked about again before the next interval; a failure in passing is, at the next look. */
+  private CompletableFuture<VaultController.ReauthOutcome> refreshToken() {
+    return vault
+        .reauth()
+        .thenApply(
+            outcome -> {
+              if (outcome != VaultController.ReauthOutcome.TRANSIENT) tokenSinceMs = System.currentTimeMillis();
+              return outcome;
+            });
+  }
+
+  private void refreshOldToken() {
+    if (isTokenDue(connected, System.currentTimeMillis() - tokenSinceMs)) refreshToken();
+  }
+
+  /** Whether a token of this age is refreshed now: only on an open socket (one that is reconnecting
+   *  has its token refreshed when the upgrade is rejected). Static for unit testing. */
+  static boolean isTokenDue(boolean socketOpen, long tokenAgeMs) {
+    return socketOpen && tokenAgeMs >= TOKEN_REFRESH_MS;
   }
 
   /** Rejects all in-flight request futures: the gateway replies on the connection a request
@@ -468,6 +511,7 @@ public final class Connection {
       Connection.this.ws = null;
       failPending("WebSocket failure: " + t);
       if (stopped) return;
+      if (response != null) ApiClient.noteRefusal(response);
       int status = response != null ? response.code() : 0;
       if (shouldReauthAfterUpgradeFailure(status)) {
         // Upgrade rejected: 401 = expired/invalid token; 410 = manifest missing (also revokes the

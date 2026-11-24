@@ -17,28 +17,53 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BooleanSupplier;
+import java.util.function.Predicate;
+import java.util.function.Supplier;
 
 /**
- * Port of {@code sdk/ts/src_ts/client/Vault.ts} — Phase 2 subset: login + manifest validation +
- * {@code deriveKeys} (unlock the vault key from this member's KEM-wrapped slot). Manifest
- * mutation (CAS PUT), member add/remove + key rotation, and reauth land in Phase 3.
+ * Port of {@code sdk/ts/src_ts/client/Vault.ts}: login, the held manifest and what this member's
+ * keys open in it, manifest updates (members, collections, invites) and reauth.
+ *
+ * <p>Threads (Java only; the TS original has one). Two things keep the held manifest whole:
+ *
+ * <ol>
+ *   <li>turns ({@link #exclusive}): updates and refreshes of the manifest run one at a time.
+ *   <li>{@link #lock}: a turn moves the manifest, the keys and the collections list under it, and a
+ *       reader outside a turn (a pending invite looked up, logout) takes it, so it never sees a
+ *       manifest next to keys that do not open it. Never held across a network call.
+ * </ol>
  */
 public final class VaultController {
-  private final String serviceUrl;
-  private final MemberInfoBasics activeMember;
-  private Map<String, Object> vaultManifest;
-  private String etag;
-  private volatile String authToken;
-  private int manifestVersion;
+  /** How often an update is applied again on top of a manifest another device committed first. */
+  private static final int MANIFEST_CAS_RETRIES = 3;
 
-  private byte[] aeadVaultKey;
-  private boolean isManagerMember;
-  private byte[] managersKey;
-  private byte[] collectionsKey;
-  private List<Map<String, Object>> memberList;
+  private final String serviceUrl;
+  private final String vaultId;
+  private final MemberInfoBasics activeMember;
+  private volatile String authToken;
+
+  private final Object lock = new Object();
+  private volatile Map<String, Object> vaultManifest;
+  private volatile int manifestVersion;
+  private volatile String etag;
+  private volatile byte[] aeadVaultKey;
+  private volatile boolean isManagerMember;
+  private volatile byte[] managersKey;
+  private volatile byte[] collectionsKey;
+  private volatile List<Map<String, Object>> memberList;
+  /** The last turn: the next one starts when it has ended. */
+  private final AtomicReference<CompletableFuture<Void>> manifestTurn =
+      new AtomicReference<>(CompletableFuture.completedFuture(null));
+  /** Collections being created: their first blob is on its way and no manifest lists them yet, but
+   *  their names are taken. Logout empties it, which abandons them. */
+  private final Set<CollectionController> pendingCollections = ConcurrentHashMap.newKeySet();
   /** Serializes {@link #reauth()} dispatch so concurrent 401s share one POST and one token. */
   private final Object reauthLock = new Object();
   /** Non-null while a reauth is in flight; {@link #reauth()} joins it instead of re-dispatching. */
@@ -46,23 +71,21 @@ public final class VaultController {
   /** Fired once when a reauth comes back {@link ReauthOutcome#REVOKED}: a manager removed this
    *  device. Wired by {@link Account}. */
   volatile Runnable onRevoked;
+  /** Run when an update here had to take in a manifest another device committed first. Nothing else
+   *  announces that one: its frame finds the version already held. Wired by {@link Tasker#hookVault}. */
+  volatile Runnable onAdopted;
 
-  /** Observable list of this vault's collections (decrypted from the manifest at unlock). */
+  /** Observable list of this vault's collections (decrypted from the manifest at unlock). Listeners
+   *  run inside the update that changed the list: they must not wait for another update of this vault. */
   public final ReactiveValue<List<CollectionController>> collections = new ReactiveValue<>(new ArrayList<>());
 
   private VaultController(
-      String serviceUrl,
-      Map<String, Object> vaultManifest,
-      String etag,
-      String authToken,
-      MemberInfoBasics activeMember,
-      int manifestVersion) {
+      String serviceUrl, String vaultId, String etag, String authToken, MemberInfoBasics activeMember) {
     this.serviceUrl = serviceUrl;
-    this.vaultManifest = vaultManifest;
+    this.vaultId = vaultId;
     this.etag = etag;
     this.authToken = authToken;
     this.activeMember = activeMember;
-    this.manifestVersion = manifestVersion;
   }
 
   /** Sign a login request, POST it, validate the returned manifest, and unlock the vault key. */
@@ -96,86 +119,16 @@ public final class VaultController {
               VaultController vc =
                   new VaultController(
                       serviceUrl,
-                      manifest,
+                      (String) payload.get("id"),
                       (String) resp.get("vaultEtag"),
                       (String) resp.get("authToken"),
-                      member,
-                      intOr(resp.get("manifestVersion"), 1));
-              vc.deriveKeys();
+                      member);
+              vc.hold(new ManifestResult(manifest, intOr(resp.get("manifestVersion"), 1)));
               return vc;
             });
   }
 
-  /** Decapsulate this member's KEM ciphertext, unwrap the role key, and derive sub-keys. */
-  @SuppressWarnings("unchecked")
-  private void deriveKeys() {
-    Map<String, Object> payload = (Map<String, Object>) vaultManifest.get("payload");
-    List<Object> slots = (List<Object>) payload.get("memberSlots");
-    Map<String, Object> slot = Validators.getMemberFromMemberSlots(slots, activeMember.memberId);
-    if (slot == null) throw new CodedException("Active member slot not found in manifest", "NO_MEMBER_SLOT");
-
-    byte[] shared =
-        CryptoPQ.decapsulate(activeMember.kemKeys, Helpers.fromBase64((String) slot.get("memberKemCiphertext")));
-    byte[] roleKey = AEAD.decrypt(shared, Helpers.fromBase64((String) slot.get("memberVaultKeyWrapped")));
-    this.aeadVaultKey = roleKey;
-
-    if (Consts.isManagerRole((String) slot.get("memberRole"))) {
-      this.managersKey = Members.getManagerKey(roleKey);
-      this.memberList = Members.decryptMemberList((String) payload.get("managerOnlyMemberList"), managersKey);
-      this.isManagerMember = true;
-      this.collectionsKey = Members.getCollectionsKey(roleKey);
-    } else {
-      this.isManagerMember = false;
-      this.collectionsKey = this.aeadVaultKey;
-    }
-    this.collections.set(decryptCollectionsList());
-  }
-
-  // ── manifest CAS update (PUT /api/auth/manifest) ──
-
-  private CompletableFuture<Map<String, Object>> trySignAndPut(int basedOnVersion) {
-    Map<String, Object> payload = payload();
-    payload.put("updatedAt", Helpers.isoNow());
-    byte[] hash = CryptoUtils.sha256(Helpers.utf8(Json.canonical(payload)));
-    Map<String, Object> body =
-        Json.obj(
-            "prevVersion", basedOnVersion,
-            "payload", payload,
-            "payloadHash", Helpers.base64(hash),
-            "signerId", activeMember.memberId,
-            "signature", Helpers.base64(CryptoPQ.sign(activeMember.dsaKeys.secretKey, hash)));
-    return ApiClient.authRequest("PUT", serviceUrl + "/api/auth/manifest", authToken, body, authedHeaders())
-        .thenApply(ApiClient.ApiResponse::jsonObject);
-  }
-
-  /** Sign + PUT the current payload, CAS-pinned to {@code manifestVersion}; on 412 refresh the
-   *  version from the response and retry once (mirrors TS {@code #saveUpdate}). */
-  private CompletableFuture<Void> saveUpdate() {
-    return trySignAndPut(manifestVersion)
-        .thenCompose(
-            result -> {
-              if (!Boolean.TRUE.equals(result.get("ok"))
-                  && "VERSION_MISMATCH".equals(result.get("code"))
-                  && result.get("currentVersion") instanceof Number) {
-                manifestVersion = ((Number) result.get("currentVersion")).intValue();
-                return trySignAndPut(manifestVersion);
-              }
-              return CompletableFuture.completedFuture(result);
-            })
-        .thenAccept(
-            result -> {
-              if (!Boolean.TRUE.equals(result.get("ok"))) {
-                throw new CodedException(
-                    "Manifest update failed: " + result.get("statusCode") + " " + result.get("message"),
-                    "MANIFEST_UPDATE_FAILED");
-              }
-              manifestVersion = ((Number) result.get("version")).intValue();
-              etag = (String) result.get("etag");
-            });
-  }
-
-  // ── manifest refresh (GET /api/auth/manifest) + reauth ──
-
+  /** A manifest and the version the server has it under. */
   private static final class ManifestResult {
     final Map<String, Object> vault;
     final int version;
@@ -186,42 +139,204 @@ public final class VaultController {
     }
   }
 
+  /**
+   * Make {@code confirmed} the manifest held: this member's keys are unwrapped from its slot, and the
+   * member and collections lists are read with them. Everything is derived first and the vault moves
+   * in the block at the end, which cannot fail part-way: a manifest this device cannot open leaves
+   * the vault as it was.
+   */
   @SuppressWarnings("unchecked")
-  private CompletableFuture<ManifestResult> fetchLatestManifest() {
+  private void hold(ManifestResult confirmed) {
+    Map<String, Object> payload = payloadOf(confirmed.vault);
+    Map<String, Object> slot =
+        Validators.getMemberFromMemberSlots((List<Object>) payload.get("memberSlots"), activeMember.memberId);
+    if (slot == null) throw new CodedException("Active member slot not found in manifest", "NO_MEMBER_SLOT");
+
+    byte[] shared =
+        CryptoPQ.decapsulate(activeMember.kemKeys, Helpers.fromBase64((String) slot.get("memberKemCiphertext")));
+    byte[] roleKey = AEAD.decrypt(shared, Helpers.fromBase64((String) slot.get("memberVaultKeyWrapped")));
+    boolean isManager = Consts.isManagerRole((String) slot.get("memberRole"));
+    byte[] managerKey = isManager ? Members.getManagerKey(roleKey) : null;
+    List<Map<String, Object>> members =
+        isManager
+            ? Members.decryptMemberList((String) payload.get("managerOnlyMemberList"), managerKey)
+            : Collections.emptyList();
+    byte[] listKey = isManager ? Members.getCollectionsKey(roleKey) : roleKey;
+    List<CollectionController> listed = decryptCollectionsList(payload, listKey);
+
+    synchronized (lock) {
+      this.vaultManifest = confirmed.vault;
+      this.manifestVersion = confirmed.version;
+      this.aeadVaultKey = roleKey;
+      this.isManagerMember = isManager;
+      this.managersKey = managerKey;
+      this.memberList = members;
+      this.collectionsKey = listKey;
+      mergeCollections(listed);
+    }
+  }
+
+  // ── manifest updates (PUT /api/auth/manifest), one at a time ──
+
+  /**
+   * Everything that changes or replaces the held manifest takes its turn here. An update reads the
+   * manifest, changes it and puts it, and on failure goes back to the one it started from: that only
+   * holds while nothing else moves the manifest in between.
+   *
+   * <p>The returned future completes inside the turn, before the next one starts, so what a caller
+   * chains on it sees the vault as its own update left it. That code must not wait for another turn
+   * of this vault. Cancelling the future does not end the turn.
+   */
+  private <T> CompletableFuture<T> exclusive(Supplier<CompletableFuture<T>> task) {
+    CompletableFuture<T> result = new CompletableFuture<>();
+    CompletableFuture<Void> ended = new CompletableFuture<>();
+    manifestTurn
+        .getAndSet(ended)
+        .thenCompose(free -> task.get())
+        .whenComplete(
+            (value, failure) -> {
+              if (failure == null) result.complete(value);
+              else result.completeExceptionally(failure);
+              ended.complete(null);
+            });
+    return result;
+  }
+
+  /** Apply {@code change} to the held manifest and put it: see {@link #applyAndPut}. */
+  private CompletableFuture<Void> saveUpdate(BooleanSupplier change) {
+    return exclusive(() -> applyAndPut(change, 0));
+  }
+
+  /**
+   * Apply a change to the held manifest and put it. A change that finds the manifest already says
+   * what it wants returns false, and nothing is sent. When the server's manifest turns out to be
+   * ahead of the one changed, the change is applied again on top of that one, so it must be written
+   * to run more than once. Whatever fails (the change itself, the request, a refusal that stands),
+   * the vault is left on the manifest the server last confirmed: a failed update neither blocks the
+   * next one nor rides along with it.
+   */
+  private CompletableFuture<Void> applyAndPut(BooleanSupplier change, int attempt) {
+    ManifestResult confirmed = heldCopy();
+    return CompletableFuture.completedFuture(null) // a change that throws fails the future like anything after it
+        .thenCompose(start -> applied(change) ? put(confirmed, attempt) : CompletableFuture.completedFuture(true))
+        .whenComplete(
+            (taken, failure) -> {
+              if (failure != null) hold(confirmed);
+            })
+        .thenCompose(
+            taken -> taken ? CompletableFuture.<Void>completedFuture(null) : applyAndPut(change, attempt + 1));
+  }
+
+  /** What is held, out of reach of a change. */
+  private ManifestResult heldCopy() {
+    Map<String, Object> copy = new HashMap<>(vaultManifest);
+    copy.put("payload", Json.parseObject(Json.canonical(payload())));
+    return new ManifestResult(copy, manifestVersion);
+  }
+
+  private boolean applied(BooleanSupplier change) {
+    synchronized (lock) {
+      return change.getAsBoolean();
+    }
+  }
+
+  /**
+   * Sign and put the held manifest, which was changed from {@code base}. True when the server took
+   * it. False when the server's manifest was ahead of {@code base}: that one is held now, for the
+   * change to be applied again. Every refusal is checked for that, not only a version mismatch: a
+   * gateway that was busy with another update answers 503, and one from before it compared versions
+   * first tells a device one key rotation behind that its key epoch is too low. A refusal from a
+   * server that is not ahead stands.
+   */
+  private CompletableFuture<Boolean> put(ManifestResult base, int attempt) {
+    return signAndPut()
+        .thenCompose(
+            answer -> {
+              if (Boolean.TRUE.equals(answer.get("ok"))) {
+                synchronized (lock) {
+                  manifestVersion = ((Number) answer.get("version")).intValue();
+                  etag = (String) answer.get("etag");
+                }
+                return CompletableFuture.completedFuture(true);
+              }
+              CodedException refused =
+                  new CodedException(
+                      "Manifest update failed: " + answer.get("statusCode") + " " + answer.get("message"),
+                      "MANIFEST_UPDATE_FAILED");
+              if (attempt >= MANIFEST_CAS_RETRIES) throw refused;
+              return fetchLatestManifest(keyEpoch(payloadOf(base.vault)))
+                  .handle(
+                      (latest, unreachable) -> {
+                        if (unreachable != null || latest.version <= base.version) throw refused;
+                        hold(latest);
+                        Runnable announce = onAdopted;
+                        if (announce != null) announce.run();
+                        return false;
+                      });
+            });
+  }
+
+  private CompletableFuture<Map<String, Object>> signAndPut() {
+    Map<String, Object> payload = payload();
+    synchronized (lock) {
+      payload.put("updatedAt", Helpers.isoNow());
+    }
+    byte[] hash = CryptoUtils.sha256(Helpers.utf8(Json.canonical(payload)));
+    Map<String, Object> body =
+        Json.obj(
+            "prevVersion", manifestVersion,
+            "payload", payload,
+            "payloadHash", Helpers.base64(hash),
+            "signerId", activeMember.memberId,
+            "signature", Helpers.base64(CryptoPQ.sign(activeMember.dsaKeys.secretKey, hash)));
+    // Tokens expire while the app stays open: on 401 the token is refreshed and the same signed manifest sent once more.
+    String url = serviceUrl + "/api/auth/manifest";
+    return Tasker.withReauth(
+            () -> ApiClient.authRequest("PUT", url, authToken, body, authedHeaders()), this::handleAuthError)
+        .thenApply(ApiClient.ApiResponse::jsonObject);
+  }
+
+  // ── manifest refresh (GET /api/auth/manifest) + reauth ──
+
+  /** The server's manifest. Fails unless it is valid, of this vault, and not below {@code floorEpoch}
+   *  (see {@link #rollbackCheckedEpoch}). */
+  @SuppressWarnings("unchecked")
+  private CompletableFuture<ManifestResult> fetchLatestManifest(long floorEpoch) {
     String url = serviceUrl + "/api/auth/manifest";
     return Tasker.withReauth(
             () -> ApiClient.authRequest("GET", url, authToken, null, authedHeaders()), this::handleAuthError)
         .thenApply(
             resp -> {
-              if (!resp.ok()) return null;
-              Map<String, Object> body = resp.jsonObject();
-              if (!Boolean.TRUE.equals(body.get("ok"))) return null;
-              return new ManifestResult((Map<String, Object>) body.get("accountVault"), intOr(body.get("version"), 1));
+              Map<String, Object> body = resp.ok() ? resp.jsonObject() : null;
+              if (body == null || !Boolean.TRUE.equals(body.get("ok"))) {
+                throw new CodedException("Manifest fetch failed: " + resp.status, "MANIFEST_FETCH_FAILED");
+              }
+              Map<String, Object> vault = (Map<String, Object>) body.get("accountVault");
+              if (!Validators.isValidVaultManifest(vault, Consts.VAULT_TYPE_ACCOUNT)
+                  || !vaultId.equals(payloadOf(vault).get("id"))) {
+                throw new CodedException("Invalid vault manifest received from server", "INVALID_MANIFEST");
+              }
+              rollbackCheckedEpoch(floorEpoch, payloadOf(vault));
+              return new ManifestResult(vault, intOr(body.get("version"), 1));
             });
   }
 
-  /** Refresh local state from the server (re-deriving keys if the epoch rotated). */
-  public CompletableFuture<Void> timeToFetchUpdate() {
-    return fetchLatestManifest()
-        .thenAccept(
-            result -> {
-              if (result == null || !Validators.isValidVaultManifest(result.vault, Consts.VAULT_TYPE_ACCOUNT)) return;
-              long oldEpoch = ((Number) payload().get("keyEpoch")).longValue();
-              @SuppressWarnings("unchecked")
-              Map<String, Object> newPayload = (Map<String, Object>) result.vault.get("payload");
-              long newEpoch = rollbackCheckedEpoch(oldEpoch, newPayload);
-              this.vaultManifest = result.vault;
-              this.manifestVersion = result.version;
-              if (newEpoch != oldEpoch) {
-                deriveKeys(); // re-derives keys + re-sets the collections list
-              } else {
-                if (isManagerMember && managersKey != null) {
-                  this.memberList =
-                      Members.decryptMemberList((String) newPayload.get("managerOnlyMemberList"), managersKey);
-                }
-                mergeCollections(decryptCollectionsList()); // pick up collection-list changes at the same epoch
-              }
-            });
+  /**
+   * Refresh local state from the server. True when the server's manifest was newer than the one held
+   * when this refresh got its turn: an update of this device that was on its way when the refresh was
+   * asked for is not reported as a change from elsewhere. Fails when no manifest this device can hold
+   * came back.
+   */
+  public CompletableFuture<Boolean> timeToFetchUpdate() {
+    return exclusive(
+        () ->
+            fetchLatestManifest(keyEpoch(payload()))
+                .thenApply(
+                    latest -> {
+                      boolean newer = latest.version != manifestVersion;
+                      hold(latest);
+                      return newer;
+                    }));
   }
 
   /**
@@ -373,26 +488,31 @@ public final class VaultController {
   // ── members (add / remove → key rotation + signed manifest PUT) ──
 
   /** Generate a fresh vault key, rewrap the manager area, and re-encapsulate the vault key for
-   *  every member slot under its KEM public key. Mutates the manifest payload in place. */
+   *  every member slot under its KEM public key. Everything is computed first, and the vault moves to
+   *  the new key in the block at the end, which cannot fail part-way: a failure before it (a member
+   *  whose KEM key cannot be used) leaves the vault exactly as it was. */
   private void rotateAndRewrapForMembers(List<Object> newSlots, List<Map<String, Object>> newDetails) {
     if (!isManagerMember || managersKey == null) {
       throw new CodedException("Only manager members can rotate vault keys", "NOT_MANAGER");
     }
-    byte[] oldManagerKey = this.managersKey;
     byte[] newVaultKey = AEAD.generateRawAEADKeyData();
     byte[] newManagerKey = Members.getManagerKey(newVaultKey);
     byte[] newCollectionsKey = Members.getCollectionsKey(newVaultKey);
     Map<String, Object> payload = payload();
+    long newEpoch = keyEpoch(payload) + 1;
 
-    Object areaB64 = payload.get("managerOnlyArea");
-    if (areaB64 instanceof String && !((String) areaB64).isEmpty()) {
-      byte[] areaPlain = AEAD.decrypt(oldManagerKey, Helpers.fromBase64((String) areaB64));
-      payload.put("managerOnlyArea", Helpers.base64(AEAD.encrypt(newManagerKey, areaPlain)));
+    // The manager-only area moves under the new managersKey: the rotation would otherwise orphan it
+    // under the discarded one.
+    Object managerOnlyArea = payload.get("managerOnlyArea");
+    if (managerOnlyArea instanceof String && !((String) managerOnlyArea).isEmpty()) {
+      byte[] areaPlain = AEAD.decrypt(managersKey, Helpers.fromBase64((String) managerOnlyArea));
+      managerOnlyArea = Helpers.base64(AEAD.encrypt(newManagerKey, areaPlain));
     }
 
+    List<Object> rewrappedSlots = new ArrayList<>();
     for (Object so : newSlots) {
       @SuppressWarnings("unchecked")
-      Map<String, Object> slot = (Map<String, Object>) so;
+      Map<String, Object> slot = new HashMap<>((Map<String, Object>) so); // a copy: the held slot stays as it is
       Map<String, Object> detail = Validators.getMemberFromMemberSlots(newDetails, slot.get("memberId"));
       if (detail == null) throw new CodedException("Missing detail for " + slot.get("memberId"), "MISSING_DETAIL");
       CryptoPQ.Encapsulated enc = CryptoPQ.encapsulate(Helpers.fromBase64((String) detail.get("memberKemPubkey")));
@@ -403,21 +523,28 @@ public final class VaultController {
       slot.put("memberKemCiphertext", Helpers.base64(enc.cipherText));
       slot.put("memberVaultKeyWrapped", Helpers.base64(wrapped));
       slot.put("updatedAt", System.currentTimeMillis());
+      rewrappedSlots.add(slot);
     }
+    String managerOnlyMemberList = Members.encryptMemberList(newDetails, newManagerKey);
+    String collectionsEncrypted = encryptCollectionsList(newCollectionsKey); // re-key the real list
 
-    payload.put("managerOnlyMemberList", Members.encryptMemberList(newDetails, newManagerKey));
-    payload.put("collectionsEncrypted", encryptCollectionsList(newCollectionsKey)); // re-key the real list
+    // The move to the new key: nothing from here on can fail.
+    if (managerOnlyArea != null) payload.put("managerOnlyArea", managerOnlyArea);
+    payload.put("managerOnlyMemberList", managerOnlyMemberList);
+    payload.put("collectionsEncrypted", collectionsEncrypted);
+    payload.put("memberSlots", rewrappedSlots);
+    payload.put("keyEpoch", newEpoch);
     // newVaultKey is retained as aeadVaultKey (not zeroed): unlike the TS WebCrypto path that
     // imports a copy then wipes the raw, this port uses the raw bytes directly as the key.
     this.aeadVaultKey = newVaultKey;
     this.managersKey = newManagerKey;
     this.collectionsKey = newCollectionsKey;
     this.memberList = newDetails;
-    payload.put("keyEpoch", ((Number) payload.get("keyEpoch")).longValue() + 1);
-    payload.put("memberSlots", newSlots);
   }
 
-  /** Add a member by its KEM+DSA public keys (rotates keys, re-wraps for all, PUTs the manifest). */
+  /** Add a member by its KEM+DSA public keys (rotates keys, re-wraps for all, PUTs the manifest).
+   *  A member the manifest already lists is left as it is and its slot returned: adding it again,
+   *  after a retry or because another manager was first, would list it twice. */
   public CompletableFuture<Map<String, Object>> addMemberByPublicKeys(
       String kemPubkeyB64, String dsaPubkeyB64, String memberName, String memberRole, String privateNote) {
     if (!isManagerMember || managersKey == null) {
@@ -447,12 +574,17 @@ public final class VaultController {
             "memberAddedAt", ts);
     if (privateNote != null) newDetail.put("memberPrivateNote", privateNote);
 
-    List<Object> newSlots = new ArrayList<>(slots());
-    newSlots.add(newSlot);
-    List<Map<String, Object>> newDetails = new ArrayList<>(memberList);
-    newDetails.add(newDetail);
-    rotateAndRewrapForMembers(newSlots, newDetails);
-    return saveUpdate().thenApply(x -> Validators.getMemberFromMemberSlots(slots(), memberId));
+    return saveUpdate(
+            () -> {
+              if (Validators.getMemberFromMemberSlots(slots(), memberId) != null) return false;
+              List<Object> newSlots = new ArrayList<>(slots());
+              newSlots.add(newSlot);
+              List<Map<String, Object>> newDetails = new ArrayList<>(memberList);
+              newDetails.add(newDetail);
+              rotateAndRewrapForMembers(newSlots, newDetails);
+              return true;
+            })
+        .thenApply(x -> Validators.getMemberFromMemberSlots(slots(), memberId));
   }
 
   /** Add a member from a seed (derives its keypair, then {@link #addMemberByPublicKeys}). */
@@ -470,22 +602,29 @@ public final class VaultController {
     if (memberId.equals(activeMember.memberId)) {
       throw new CodedException("Cannot remove yourself", "REMOVE_SELF");
     }
-    if (Validators.getMemberFromMemberSlots(slots(), memberId) == null) throw new CodedException("Member not found", "MEMBER_NOT_FOUND");
-    List<Object> newSlots = new ArrayList<>();
-    for (Object s : slots()) if (!memberId.equals(((Map<?, ?>) s).get("memberId"))) newSlots.add(s);
-    List<Map<String, Object>> newDetails = new ArrayList<>();
-    for (Map<String, Object> d : memberList) if (!memberId.equals(d.get("memberId"))) newDetails.add(d);
-    rotateAndRewrapForMembers(newSlots, newDetails);
-    return saveUpdate().thenApply(x -> true);
+    return saveUpdate(
+            () -> {
+              if (Validators.getMemberFromMemberSlots(slots(), memberId) == null) {
+                throw new CodedException("Member not found", "MEMBER_NOT_FOUND");
+              }
+              List<Object> newSlots = new ArrayList<>();
+              for (Object s : slots()) if (!memberId.equals(((Map<?, ?>) s).get("memberId"))) newSlots.add(s);
+              List<Map<String, Object>> newDetails = new ArrayList<>();
+              for (Map<String, Object> d : memberList) if (!memberId.equals(d.get("memberId"))) newDetails.add(d);
+              rotateAndRewrapForMembers(newSlots, newDetails);
+              return true;
+            })
+        .thenApply(x -> true);
   }
 
   // ── collections ──
 
+  /** The collections {@code payload} lists, read with {@code key}. */
   @SuppressWarnings("unchecked")
-  private List<CollectionController> decryptCollectionsList() {
-    Object enc = payload().get("collectionsEncrypted");
-    if (!(enc instanceof String) || ((String) enc).isEmpty() || collectionsKey == null) return new ArrayList<>();
-    byte[] plain = AEAD.decrypt(collectionsKey, Helpers.fromBase64((String) enc));
+  private List<CollectionController> decryptCollectionsList(Map<String, Object> payload, byte[] key) {
+    Object enc = payload.get("collectionsEncrypted");
+    if (!(enc instanceof String) || ((String) enc).isEmpty() || key == null) return new ArrayList<>();
+    byte[] plain = AEAD.decrypt(key, Helpers.fromBase64((String) enc));
     List<CollectionController> out = new ArrayList<>();
     for (Object o : (List<Object>) Json.parse(Helpers.fromUtf8(plain))) {
       Map<String, Object> c = (Map<String, Object>) o;
@@ -512,53 +651,83 @@ public final class VaultController {
     payload().put("collectionsEncrypted", encryptCollectionsList(collectionsKey));
   }
 
-  private void mergeCollections(List<CollectionController> incoming) {
-    Map<String, CollectionController> current = new HashMap<>();
-    for (CollectionController c : collections.get()) current.put(c.getId(), c);
+  /**
+   * The collections the held manifest lists. A controller already handed out is kept, its tasker and
+   * loaded content with it, under the name the manifest gives it. One the manifest no longer lists is
+   * disposed, unless it is still being created. Called with {@link #lock} held.
+   */
+  private void mergeCollections(List<CollectionController> listed) {
+    Map<String, CollectionController> unlisted = new HashMap<>();
+    for (CollectionController c : collections.get()) unlisted.put(c.getId(), c);
     List<CollectionController> merged = new ArrayList<>();
-    for (CollectionController inc : incoming) {
-      CollectionController existing = current.get(inc.getId());
-      merged.add(existing != null ? existing : inc);
+    for (CollectionController fresh : listed) {
+      CollectionController existing = unlisted.remove(fresh.getId());
+      if (existing != null) existing.adoptName(fresh.getName());
+      merged.add(existing != null ? existing : fresh);
     }
     collections.set(merged);
+    for (CollectionController c : unlisted.values()) if (!pendingCollections.contains(c)) c.dispose();
   }
 
   public List<CollectionController> listCollections() {
     return collections.get();
   }
 
-  /** Create a KV collection: upload its initial blob (CAS first-write), then sign the manifest with
-   *  the updated collections list. Manager-only. */
+  /**
+   * Create a KV collection: upload its initial blob (CAS first-write), then sign the manifest with
+   * the updated collections list. Manager-only. Until the manifest lists it the collection is in
+   * no list: a create that fails leaves nothing behind for a later update to commit.
+   */
   public CompletableFuture<KVContent> createCollection(String name, String type, Tasker tasker) {
     if (!Validators.isValidCollectionName(name)) throw new CodedException("Invalid collection name", "INVALID_COLLECTION_NAME");
     if (!Validators.isValidCollectionType(type)) throw new CodedException("Invalid collection type", "INVALID_COLLECTION_TYPE");
-    for (CollectionController c : collections.get()) {
-      if (name.trim().equals(c.getName())) throw new CodedException("Collection name must be unique", "DUPLICATE_COLLECTION");
-    }
+    requireUnusedName(name, collections.get());
+    requireUnusedName(name, pendingCollections);
     if (!isManagerMember || collectionsKey == null) {
       throw new CodedException("Only manager members can create collections", "NOT_MANAGER");
     }
     CollectionController col = CollectionController.createNew(name, type, this, activeMember.memberId);
+    byte[] blob = col.serialize();
+    pendingCollections.add(col);
+    return tasker
+        .upload(this, col.getId(), blob, col.getEncKey(), 0)
+        .thenCompose(
+            up -> {
+              col.setInitialVersion(up.version);
+              return saveUpdate(() -> list(col));
+            })
+        .whenComplete(
+            (listed, failure) -> {
+              pendingCollections.remove(col);
+              // It was in the list while its manifest was on its way: whoever loaded it then must not keep saving it.
+              if (failure != null) col.dispose();
+            })
+        .thenApply(
+            listed -> {
+              col.attachTasker(tasker, true);
+              return col.content();
+            });
+  }
+
+  /** The change that lists a created collection. The name is checked again: another device may have
+   *  listed one of that name since the create began. */
+  private boolean list(CollectionController col) {
+    if (!pendingCollections.contains(col)) {
+      throw new CodedException("Logged out while the collection was created", "CREATE_ABANDONED");
+    }
+    requireUnusedName(col.getName(), collections.get());
     // A new list, never an edit in place: other threads iterate the one they hold.
     List<CollectionController> grown = new ArrayList<>(collections.get());
     grown.add(col);
     collections.set(grown);
-    return tasker
-        .upload(this, col.getId(), col.serialize(), col.getEncKey(), 0)
-        .thenCompose(
-            up -> {
-              if (!collections.get().contains(col)) {
-                // The list was replaced while the blob went up (a logout, a manifest from another device):
-                // a manifest written now would not list this collection, and nothing would ever dispose it.
-                col.dispose();
-                throw new CodedException("Collection list changed while creating", "CREATE_ABANDONED");
-              }
-              col.setInitialVersion(up.version);
-              col.attachTasker(tasker, true);
-              encryptAndUpdateCollectionsList();
-              return saveUpdate();
-            })
-        .thenApply(x -> col.content());
+    encryptAndUpdateCollectionsList();
+    return true;
+  }
+
+  private static void requireUnusedName(String name, Iterable<CollectionController> among) {
+    for (CollectionController c : among) {
+      if (name.trim().equals(c.getName())) throw new CodedException("Collection name must be unique", "DUPLICATE_COLLECTION");
+    }
   }
 
   public CompletableFuture<KVContent> getCollectionByName(Tasker tasker, String name) {
@@ -572,18 +741,21 @@ public final class VaultController {
   }
 
   public CompletableFuture<Boolean> renameCollectionById(String colId, String newName) {
-    CollectionController col = findCollection(colId);
-    if (col == null) throw new CodedException("Collection not found", "COLLECTION_NOT_FOUND");
-    col.setName(newName, activeMember.memberId);
-    encryptAndUpdateCollectionsList();
-    return saveUpdate().thenApply(x -> true);
+    return saveUpdate(
+            () -> {
+              CollectionController col = findCollection(colId);
+              if (col == null) throw new CodedException("Collection not found", "COLLECTION_NOT_FOUND");
+              col.setName(newName, activeMember.memberId);
+              encryptAndUpdateCollectionsList();
+              return true;
+            })
+        .thenApply(x -> true);
   }
 
   public CompletableFuture<Boolean> removeCollectionById(Tasker tasker, String colId) {
     if (!isManagerMember || collectionsKey == null) {
       throw new CodedException("Only manager members can remove collections", "NOT_MANAGER");
     }
-    CollectionController removed = findCollection(colId);
     // Soft-delete via Tasker (reauth-on-401). A blob already gone (NOT_FOUND) or already trashed
     // (TRASHED) still gets pruned from the manifest.
     return tasker
@@ -594,19 +766,20 @@ public final class VaultController {
               throw err instanceof RuntimeException ? (RuntimeException) err : new CompletionException(err);
             })
         .thenCompose(
-            x -> {
-              // Disposed only now that it is gone: a collection whose delete failed stays in the list and must still save.
-              // Both the one that was listed when this began and whatever a manifest refresh put in its place since.
-              if (removed != null) removed.dispose();
-              List<CollectionController> kept = new ArrayList<>();
-              for (CollectionController c : collections.get()) {
-                if (colId.equals(c.getId())) c.dispose();
-                else kept.add(c);
-              }
-              collections.set(kept);
-              encryptAndUpdateCollectionsList();
-              return saveUpdate();
-            })
+            x ->
+                saveUpdate(
+                    () -> {
+                      // Disposed only now that it is gone: a collection whose delete failed stays in the list and must still save.
+                      List<CollectionController> kept = new ArrayList<>();
+                      for (CollectionController c : collections.get()) {
+                        if (colId.equals(c.getId())) c.dispose();
+                        else kept.add(c);
+                      }
+                      if (kept.size() == collections.get().size()) return false; // not listed (any more)
+                      collections.set(kept);
+                      encryptAndUpdateCollectionsList();
+                      return true;
+                    }))
         .thenApply(x -> true);
   }
 
@@ -623,16 +796,12 @@ public final class VaultController {
    * collections loaded afresh.
    */
   public void disposeCollections() {
-    List<CollectionController> ended = collections.get();
-    List<CollectionController> fresh;
-    try {
-      fresh = decryptCollectionsList();
-    } catch (RuntimeException unreadable) {
-      // A device being removed may hold a manifest its keys no longer open. Logout must still go through:
-      // the list is refilled by the next manifest refresh that can be read.
-      fresh = new ArrayList<>();
+    List<CollectionController> ended;
+    synchronized (lock) {
+      pendingCollections.clear();
+      ended = collections.get();
+      collections.set(decryptCollectionsList(payload(), collectionsKey));
     }
-    collections.set(fresh);
     for (CollectionController c : ended) c.dispose();
   }
 
@@ -641,9 +810,17 @@ public final class VaultController {
     return null;
   }
 
-  @SuppressWarnings("unchecked")
   private Map<String, Object> payload() {
-    return (Map<String, Object>) vaultManifest.get("payload");
+    return payloadOf(vaultManifest);
+  }
+
+  @SuppressWarnings("unchecked")
+  private static Map<String, Object> payloadOf(Map<String, Object> manifest) {
+    return (Map<String, Object>) manifest.get("payload");
+  }
+
+  private static long keyEpoch(Map<String, Object> payload) {
+    return ((Number) payload.get("keyEpoch")).longValue();
   }
 
   @SuppressWarnings("unchecked")
@@ -662,8 +839,11 @@ public final class VaultController {
   }
 
   private Map<String, Object> readManagerArea() {
-    if (managersKey == null) throw new CodedException("Only manager members can access the manager area", "NOT_MANAGER");
-    byte[] plain = AEAD.decrypt(managersKey, Helpers.fromBase64((String) payload().get("managerOnlyArea")));
+    byte[] plain;
+    synchronized (lock) {
+      if (managersKey == null) throw new CodedException("Only manager members can access the manager area", "NOT_MANAGER");
+      plain = AEAD.decrypt(managersKey, Helpers.fromBase64((String) payload().get("managerOnlyArea")));
+    }
     Map<String, Object> area = Json.parseObject(Helpers.fromUtf8(plain));
     if (!(area.get("v") instanceof Number) || ((Number) area.get("v")).intValue() != Consts.MANAGER_AREA_VERSION) {
       throw new CodedException("Unsupported managerOnlyArea version", "BAD_AREA_VERSION");
@@ -671,10 +851,16 @@ public final class VaultController {
     return area;
   }
 
-  private CompletableFuture<Void> writeManagerArea(Map<String, Object> area) {
-    if (managersKey == null) throw new CodedException("Only manager members can access the manager area", "NOT_MANAGER");
-    payload().put("managerOnlyArea", Helpers.base64(AEAD.encrypt(managersKey, Helpers.utf8(Json.canonical(area)))));
-    return saveUpdate();
+  /** Read the manager-only area, change it and put it. A change that leaves it as it was returns
+   *  false, and nothing is sent. */
+  private CompletableFuture<Void> updateManagerArea(Predicate<Map<String, Object>> change) {
+    return saveUpdate(
+        () -> {
+          Map<String, Object> area = readManagerArea();
+          if (!change.test(area)) return false;
+          payload().put("managerOnlyArea", Helpers.base64(AEAD.encrypt(managersKey, Helpers.utf8(Json.canonical(area)))));
+          return true;
+        });
   }
 
   @SuppressWarnings("unchecked")
@@ -684,16 +870,18 @@ public final class VaultController {
 
   @SuppressWarnings("unchecked")
   public CompletableFuture<Void> addPendingInvite(Map<String, Object> entry) {
-    Map<String, Object> area = readManagerArea();
-    long cutoff = System.currentTimeMillis() - Consts.INVITE_MAX_TTL_SECONDS * 1000;
-    List<Object> next = new ArrayList<>();
-    for (Object o : invitesOf(area)) {
-      Map<String, Object> i = (Map<String, Object>) o;
-      if (((Number) i.get("createdAt")).longValue() > cutoff) next.add(i);
-    }
-    next.add(entry);
-    area.put("invites", next);
-    return writeManagerArea(area);
+    return updateManagerArea(
+        area -> {
+          long cutoff = System.currentTimeMillis() - Consts.INVITE_MAX_TTL_SECONDS * 1000;
+          List<Object> next = new ArrayList<>();
+          for (Object o : invitesOf(area)) {
+            Map<String, Object> i = (Map<String, Object>) o;
+            if (((Number) i.get("createdAt")).longValue() > cutoff) next.add(i);
+          }
+          next.add(entry);
+          area.put("invites", next);
+          return true;
+        });
   }
 
   @SuppressWarnings("unchecked")
@@ -705,18 +893,20 @@ public final class VaultController {
     return null;
   }
 
+  /** Remove a consumed or cancelled invite. An invite that is not there: nothing is sent. */
   @SuppressWarnings("unchecked")
   public CompletableFuture<Void> removePendingInvite(String inviteId) {
-    Map<String, Object> area = readManagerArea();
-    List<Object> invites = invitesOf(area);
-    List<Object> next = new ArrayList<>();
-    for (Object o : invites) {
-      Map<String, Object> i = (Map<String, Object>) o;
-      if (!inviteId.equals(i.get("inviteId"))) next.add(i);
-    }
-    if (next.size() == invites.size()) return CompletableFuture.completedFuture(null);
-    area.put("invites", next);
-    return writeManagerArea(area);
+    return updateManagerArea(
+        area -> {
+          List<Object> invites = invitesOf(area);
+          List<Object> next = new ArrayList<>();
+          for (Object o : invites) {
+            Map<String, Object> i = (Map<String, Object>) o;
+            if (!inviteId.equals(i.get("inviteId"))) next.add(i);
+          }
+          area.put("invites", next);
+          return next.size() != invites.size();
+        });
   }
 
   public static final class InviteCreated {
@@ -804,7 +994,7 @@ public final class VaultController {
 
   // ── accessors ──
   public String getId() {
-    return (String) ((Map<?, ?>) vaultManifest.get("payload")).get("id");
+    return vaultId;
   }
 
   public String getAuthToken() {
@@ -839,11 +1029,13 @@ public final class VaultController {
     return memberList;
   }
 
-  /** Headers required by the authenticated routes ({@code x-vault-id} / {@code x-member-id}). */
+  /** Headers required by the authenticated routes ({@code x-vault-id} / {@code x-member-id}), and
+   *  the API version every gateway request states: the app sends these on requests it makes itself. */
   public Map<String, String> authedHeaders() {
     Map<String, String> h = new java.util.HashMap<>();
     h.put("x-vault-id", getId());
     h.put("x-member-id", activeMember.memberId);
+    h.put(Consts.HEADER_API_VERSION, String.valueOf(Consts.API_VERSION));
     return h;
   }
 
