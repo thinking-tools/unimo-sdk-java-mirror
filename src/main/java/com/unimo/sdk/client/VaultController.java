@@ -298,10 +298,8 @@ public final class VaultController {
 
   // ── manifest refresh (GET /api/auth/manifest) + reauth ──
 
-  /** The server's manifest. Fails unless it is valid, of this vault, and not below {@code floorEpoch}
-   *  (see {@link #rollbackCheckedEpoch}). */
-  @SuppressWarnings("unchecked")
-  private CompletableFuture<ManifestResult> fetchLatestManifest(long floorEpoch) {
+  /** The server's answer to {@code GET /api/auth/manifest}, not yet verified. */
+  private CompletableFuture<Map<String, Object>> fetchManifestAnswer() {
     String url = serviceUrl + "/api/auth/manifest";
     return Tasker.withReauth(
             () -> ApiClient.authRequest("GET", url, authToken, null, authedHeaders()), this::handleAuthError)
@@ -311,14 +309,29 @@ public final class VaultController {
               if (body == null || !Boolean.TRUE.equals(body.get("ok"))) {
                 throw new CodedException("Manifest fetch failed: " + resp.status, "MANIFEST_FETCH_FAILED");
               }
-              Map<String, Object> vault = (Map<String, Object>) body.get("accountVault");
-              if (!Validators.isValidVaultManifest(vault, Consts.VAULT_TYPE_ACCOUNT)
-                  || !vaultId.equals(payloadOf(vault).get("id"))) {
-                throw new CodedException("Invalid vault manifest received from server", "INVALID_MANIFEST");
-              }
-              rollbackCheckedEpoch(floorEpoch, payloadOf(vault));
-              return new ManifestResult(vault, intOr(body.get("version"), 1));
+              return body;
             });
+  }
+
+  private static int versionIn(Map<String, Object> manifestAnswer) {
+    return intOr(manifestAnswer.get("version"), 1);
+  }
+
+  /** The manifest in {@code answer}. Fails unless it is valid, of this vault, and not below
+   *  {@code floorEpoch} (see {@link #rollbackCheckedEpoch}). */
+  @SuppressWarnings("unchecked")
+  private ManifestResult verified(Map<String, Object> answer, long floorEpoch) {
+    Map<String, Object> vault = (Map<String, Object>) answer.get("accountVault");
+    if (!Validators.isValidVaultManifest(vault, Consts.VAULT_TYPE_ACCOUNT)
+        || !vaultId.equals(payloadOf(vault).get("id"))) {
+      throw new CodedException("Invalid vault manifest received from server", "INVALID_MANIFEST");
+    }
+    rollbackCheckedEpoch(floorEpoch, payloadOf(vault));
+    return new ManifestResult(vault, versionIn(answer));
+  }
+
+  private CompletableFuture<ManifestResult> fetchLatestManifest(long floorEpoch) {
+    return fetchManifestAnswer().thenApply(answer -> verified(answer, floorEpoch));
   }
 
   /**
@@ -330,12 +343,14 @@ public final class VaultController {
   public CompletableFuture<Boolean> timeToFetchUpdate() {
     return exclusive(
         () ->
-            fetchLatestManifest(keyEpoch(payload()))
+            fetchManifestAnswer()
                 .thenApply(
-                    latest -> {
-                      boolean newer = latest.version != manifestVersion;
-                      hold(latest);
-                      return newer;
+                    answer -> {
+                      // A refresh that finds the version already held (every reconnect, and the first
+                      // connection after a login) has nothing to verify, unwrap or decrypt again.
+                      if (versionIn(answer) == manifestVersion) return false;
+                      hold(verified(answer, keyEpoch(payload())));
+                      return true;
                     }));
   }
 

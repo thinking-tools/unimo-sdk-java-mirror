@@ -123,6 +123,16 @@ class VaultFailedUpdateTest {
   }
 
   @Test
+  void aRefreshThatFindsTheManifestAlreadyHeldChangesNothing() throws Exception {
+    VaultController vault = login();
+    List<Map<String, Object>> members = vault.getMemberList();
+
+    assertFalse(await(vault.timeToFetchUpdate()));
+
+    assertSame(members, vault.getMemberList()); // nothing was verified, unwrapped or decrypted again
+  }
+
+  @Test
   void aDeviceBehindByAKeyRotationCatchesUp() throws Exception {
     VaultController here = login();
     VaultController elsewhere = login();

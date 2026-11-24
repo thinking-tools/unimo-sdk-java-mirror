@@ -17,8 +17,11 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
+import java.util.function.IntFunction;
 import java.util.function.LongConsumer;
 import java.util.function.Supplier;
 
@@ -29,10 +32,10 @@ import java.util.function.Supplier;
  *
  * <ul>
  *   <li>Single-chunk (≤ {@link Consts#CHUNK_SIZE}): AEAD-encrypt → CAS head PUT.
- *   <li>Multi-chunk: HEAD probe → parallel chunk PUTs under the version it names → encrypted
- *       head-blob commit naming that version.
- *   <li>Download: GET head; if {@code chunkCount>0}, decrypt the head-blob JSON, parallel chunk
- *       GETs, concat.
+ *   <li>Multi-chunk: HEAD probe → chunk PUTs under the version it names, a few at a time ({@link
+ *       #inTurns}) → encrypted head-blob commit naming that version.
+ *   <li>Download: GET head; if {@code chunkCount>0}, decrypt the head-blob JSON, chunk GETs a few at
+ *       a time, concat.
  * </ul>
  *
  * Orchestration runs on a small daemon pool and blocks on the per-call {@link CompletableFuture}s
@@ -338,16 +341,17 @@ public final class Tasker {
       }
       byte[] uploadNonce = CryptoUtils.generateRandomBytes(Consts.UPLOAD_NONCE_BYTES);
 
+      // No chunk is encrypted before its turn, and none is started after a refused one.
       AtomicBoolean stale = new AtomicBoolean(false);
-      List<CompletableFuture<Void>> puts = new ArrayList<>();
-      for (int i = 0; i < totalChunks; i++) {
-        int start = i * Consts.CHUNK_SIZE;
-        int end = Math.min(start + Consts.CHUNK_SIZE, data.length);
-        byte[] ct = AEAD.encrypt(encKey, Arrays.copyOfRange(data, start, end));
-        String chunkId = Helpers.deriveChunkId(fileId, uploadNonce, i);
-        String url = chunkUrl(v, fileId, probe.nextVersion, chunkId);
-        puts.add(
-            authedSend(v, "PUT", url, ct, Collections.emptyMap())
+      inTurns(
+          totalChunks,
+          i -> {
+            int start = i * Consts.CHUNK_SIZE;
+            int end = Math.min(start + Consts.CHUNK_SIZE, data.length);
+            byte[] ct = AEAD.encrypt(encKey, Arrays.copyOfRange(data, start, end));
+            String chunkId = Helpers.deriveChunkId(fileId, uploadNonce, i);
+            String url = chunkUrl(v, fileId, probe.nextVersion, chunkId);
+            return authedSend(v, "PUT", url, ct, Collections.emptyMap())
                 .thenAccept(
                     r -> {
                       if (r.status == 201) return;
@@ -357,9 +361,9 @@ public final class Tasker {
                       }
                       if (r.status == 410) throw new CodedException("File is trashed", "TRASHED");
                       throw new CodedException("chunk PUT failed: " + r.status, "CHUNK_PUT_FAILED");
-                    }));
-      }
-      CompletableFuture.allOf(puts.toArray(new CompletableFuture[0])).join();
+                    });
+          },
+          stale::get);
       if (stale.get()) continue; // no commit can be issued that version any more — probe again
 
       Map<String, Object> headBlob =
@@ -397,21 +401,46 @@ public final class Tasker {
     byte[] uploadNonce = Helpers.fromHex((String) manifest.get("nonce"));
     int count = ((Number) manifest.get("count")).intValue();
 
-    List<CompletableFuture<byte[]>> gets = new ArrayList<>();
+    List<byte[]> chunks =
+        inTurns(
+            count,
+            i -> {
+              String chunkId = Helpers.deriveChunkId(fileId, uploadNonce, i);
+              return authedSend(v, "GET", chunkUrl(v, fileId, version, chunkId), null, Collections.emptyMap())
+                  .thenApply(
+                      r -> {
+                        if (!r.ok()) throw new CodedException("chunk GET failed: " + r.status, "CHUNK_GET_FAILED");
+                        return AEAD.decrypt(encKey, r.body);
+                      });
+            },
+            () -> false);
+    return new DownloadResult(etag, Helpers.concat(chunks.toArray(new byte[0][])), version);
+  }
+
+  /**
+   * Start {@code job(0)} … {@code job(count - 1)} with at most {@link Consts#TRANSFER_CONCURRENCY} in
+   * flight, and wait for them. No further job starts once one has failed or {@code stopped} says so.
+   * Returns the results in order; fails as the first failed job did.
+   */
+  static <T> List<T> inTurns(int count, IntFunction<CompletableFuture<T>> job, BooleanSupplier stopped) {
+    Semaphore free = new Semaphore(Consts.TRANSFER_CONCURRENCY);
+    AtomicBoolean failed = new AtomicBoolean();
+    List<CompletableFuture<T>> started = new ArrayList<>();
     for (int i = 0; i < count; i++) {
-      String chunkId = Helpers.deriveChunkId(fileId, uploadNonce, i);
-      gets.add(
-          authedSend(v, "GET", chunkUrl(v, fileId, version, chunkId), null, Collections.emptyMap())
-              .thenApply(
-                  r -> {
-                    if (!r.ok()) throw new CodedException("chunk GET failed: " + r.status, "CHUNK_GET_FAILED");
-                    return AEAD.decrypt(encKey, r.body);
+      free.acquireUninterruptibly(); // until one in flight has finished
+      if (failed.get() || stopped.getAsBoolean()) break;
+      started.add(
+          job.apply(i)
+              .whenComplete(
+                  (done, err) -> {
+                    if (err != null) failed.set(true);
+                    free.release();
                   }));
     }
-    CompletableFuture.allOf(gets.toArray(new CompletableFuture[0])).join();
-    byte[][] chunks = new byte[count][];
-    for (int i = 0; i < count; i++) chunks[i] = gets.get(i).join();
-    return new DownloadResult(etag, Helpers.concat(chunks), version);
+    CompletableFuture.allOf(started.toArray(new CompletableFuture[0])).join();
+    List<T> results = new ArrayList<>(started.size());
+    for (CompletableFuture<T> each : started) results.add(each.join());
+    return results;
   }
 
   // ── HTTP helpers (blocking on the orchestration worker) ──

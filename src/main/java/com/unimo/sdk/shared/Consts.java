@@ -76,6 +76,9 @@ public final class Consts {
   public static final int AEAD_OVERHEAD_BYTES = 28;
   public static final int CHUNK_SIZE = STORAGE_MAX_BLOB_BYTES - 1024;
   public static final int STORAGE_MAX_CHUNKS_PER_FILE = 8192;
+  /** Chunks of one upload or download in flight at a time. It bounds the memory a large file takes:
+   *  without it every chunk is encrypted and held at once. */
+  public static final int TRANSFER_CONCURRENCY = 4;
   public static final int UPLOAD_NONCE_BYTES = 16;
   public static final int HEAD_BLOB_SCHEMA_VERSION = 1;
 
