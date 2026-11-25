@@ -456,7 +456,7 @@ public final class Tasker {
         () -> {
           Map<String, String> h = authHeaders(v);
           h.putAll(extra);
-          return ApiClient.send(method, url, body, OCTET, h);
+          return ApiClient.send(method, url, body, OCTET, h, v);
         },
         v::handleAuthError);
   }

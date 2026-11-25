@@ -7,7 +7,6 @@ import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-import com.sun.net.httpserver.HttpServer;
 import com.unimo.sdk.Client;
 import com.unimo.sdk.client.Members.MemberInfoBasics;
 import com.unimo.sdk.client.collections.CollectionController;
@@ -15,18 +14,12 @@ import com.unimo.sdk.crypto.CryptoUtils;
 import com.unimo.sdk.shared.Consts;
 import com.unimo.sdk.shared.Helpers;
 import com.unimo.sdk.shared.Json;
-import java.io.ByteArrayOutputStream;
-import java.io.IOException;
-import java.io.InputStream;
-import java.net.InetSocketAddress;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -71,7 +64,7 @@ class VaultFailedUpdateTest {
 
     await(invite(vault));
     await(addMember(vault, "tablet"));
-    assertEquals(1L, keyEpoch(gateway.committed()));
+    assertEquals(1L, StandInGateway.keyEpoch(gateway.committed()));
     assertEquals(3, memberSlots(gateway.committed()).size());
     // The manifest on the server opens for every device, the recovery one included.
     login();
@@ -88,7 +81,7 @@ class VaultFailedUpdateTest {
 
     await(vault.timeToFetchUpdate()); // the server's manifest is not behind the one held
     await(invite(vault));
-    assertEquals(0L, keyEpoch(gateway.committed()));
+    assertEquals(0L, StandInGateway.keyEpoch(gateway.committed()));
     assertEquals(2, memberSlots(gateway.committed()).size());
     login();
   }
@@ -213,121 +206,7 @@ class VaultFailedUpdateTest {
     return pending.get(20, TimeUnit.SECONDS);
   }
 
-  @SuppressWarnings("unchecked")
-  private static Map<String, Object> payload(Map<String, Object> manifest) {
-    return (Map<String, Object>) manifest.get("payload");
-  }
-
-  private static long keyEpoch(Map<String, Object> manifest) {
-    return ((Number) payload(manifest).get("keyEpoch")).longValue();
-  }
-
   private static List<?> memberSlots(Map<String, Object> manifest) {
-    return (List<?>) payload(manifest).get("memberSlots");
-  }
-
-  /**
-   * One account, no signature checks. Keeps every manifest it is sent, and answers an update that is
-   * behind as a gateway from before it compared versions first: a lower key epoch is refused before
-   * the version is looked at.
-   */
-  private static final class StandInGateway {
-    final List<Map<String, Object>> manifests = new CopyOnWriteArrayList<>();
-    final AtomicInteger reauths = new AtomicInteger();
-    private final HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
-    /** The status the next manifest PUT is refused with; 0 when it is taken. */
-    private int nextPutRefusal;
-
-    StandInGateway() throws IOException {
-      server.createContext(
-          "/",
-          exchange -> {
-            String body = new String(readAll(exchange.getRequestBody()), "UTF-8");
-            Map<String, Object> answer = answer(exchange.getRequestMethod(), exchange.getRequestURI().getPath(), body);
-            byte[] reply = Helpers.utf8(Json.canonical(answer));
-            exchange.sendResponseHeaders(((Number) answer.get("statusCode")).intValue(), reply.length);
-            exchange.getResponseBody().write(reply);
-            exchange.close();
-          });
-      server.start();
-    }
-
-    String url() {
-      return "http://127.0.0.1:" + server.getAddress().getPort();
-    }
-
-    void stop() {
-      server.stop(0);
-    }
-
-    synchronized void refuseNextPut(int status) {
-      nextPutRefusal = status;
-    }
-
-    Map<String, Object> committed() {
-      return manifests.get(manifests.size() - 1);
-    }
-
-    private synchronized Map<String, Object> answer(String method, String path, String body) {
-      int version = manifests.size();
-      if (path.equals("/api/auth/register")) {
-        manifests.add(Json.parseObject(body));
-        return answer(200, true);
-      }
-      if (path.equals("/api/auth/login")) {
-        Map<String, Object> login = answer(200, true);
-        login.put("accountVault", committed());
-        login.put("vaultEtag", "e");
-        login.put("manifestVersion", version);
-        login.put("authToken", "t");
-        return login;
-      }
-      if (path.equals("/api/auth/reauth")) {
-        reauths.incrementAndGet();
-        Map<String, Object> refreshed = answer(200, true);
-        refreshed.put("authToken", "t2");
-        return refreshed;
-      }
-      if (path.startsWith("/api/storage/")) return stored(201, 1);
-      if (method.equals("GET")) {
-        Map<String, Object> held = answer(200, true);
-        held.put("accountVault", committed());
-        held.put("version", version);
-        return held;
-      }
-      if (nextPutRefusal != 0) {
-        Map<String, Object> refused = answer(nextPutRefusal, false);
-        nextPutRefusal = 0;
-        return refused;
-      }
-      Map<String, Object> update = Json.parseObject(body);
-      if (keyEpoch(update) < keyEpoch(committed())) return answer(400, false);
-      if (((Number) update.remove("prevVersion")).intValue() != version) {
-        Map<String, Object> behind = answer(412, false);
-        behind.put("code", "VERSION_MISMATCH");
-        behind.put("currentVersion", version);
-        return behind;
-      }
-      manifests.add(update);
-      return stored(200, version + 1);
-    }
-
-    private static Map<String, Object> stored(int status, int version) {
-      Map<String, Object> stored = answer(status, true);
-      stored.put("version", version);
-      stored.put("etag", "e");
-      return stored;
-    }
-
-    private static Map<String, Object> answer(int status, boolean ok) {
-      return Json.obj("ok", ok, "statusCode", status, "message", "stand-in " + status);
-    }
-
-    private static byte[] readAll(InputStream in) throws IOException {
-      ByteArrayOutputStream out = new ByteArrayOutputStream();
-      byte[] chunk = new byte[8192];
-      for (int read; (read = in.read(chunk)) != -1; ) out.write(chunk, 0, read);
-      return out.toByteArray();
-    }
+    return (List<?>) StandInGateway.payload(manifest).get("memberSlots");
   }
 }

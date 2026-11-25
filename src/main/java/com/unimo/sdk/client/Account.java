@@ -178,11 +178,14 @@ public final class Account {
   /**
    * Logout: the socket closes, every collection handed out is disposed (a save still queued for one
    * never uploads, and a later one fails as {@code DISPOSED}), and this account gives out no more.
-   * Flush what must be kept before calling this.
+   * Its vault ends with it: a request of that vault still on its way fails at once, as on a lost
+   * connection, so nobody waiting for one waits out its timeout, and one made later fails the same
+   * way, unsent. Log in again for a vault that works. Flush what must be kept before calling this.
    */
   public void destroy() {
     destroyed = true;
     if (connection != null) connection.stop();
     vault.disposeCollections();
+    ApiClient.cancelCalls(vault);
   }
 }

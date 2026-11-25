@@ -52,6 +52,6 @@ class ApiVersionTest {
   }
 
   private static void send(String url) throws Exception {
-    ApiClient.send("GET", url, null, Collections.emptyMap()).get(5, TimeUnit.SECONDS);
+    ApiClient.send("GET", url, null, Collections.emptyMap(), null).get(5, TimeUnit.SECONDS);
   }
 }

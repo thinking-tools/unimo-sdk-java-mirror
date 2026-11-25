@@ -31,9 +31,9 @@ class ApiClientIdleResetTest {
     server.start();
     try {
       String url = "http://127.0.0.1:" + server.getAddress().getPort() + "/";
-      ApiClient.send("GET", url, null, Collections.emptyMap()).get(5, TimeUnit.SECONDS);
+      ApiClient.send("GET", url, null, Collections.emptyMap(), null).get(5, TimeUnit.SECONDS);
       Thread.sleep(11_000); // > the pool's 10 s keep-alive
-      ApiClient.send("GET", url, null, Collections.emptyMap()).get(5, TimeUnit.SECONDS);
+      ApiClient.send("GET", url, null, Collections.emptyMap(), null).get(5, TimeUnit.SECONDS);
       assertEquals(2, ports.size());
       assertNotEquals(ports.get(0), ports.get(1), "second request reused the idle connection");
     } finally {

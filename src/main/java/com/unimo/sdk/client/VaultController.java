@@ -292,7 +292,7 @@ public final class VaultController {
     // Tokens expire while the app stays open: on 401 the token is refreshed and the same signed manifest sent once more.
     String url = serviceUrl + "/api/auth/manifest";
     return Tasker.withReauth(
-            () -> ApiClient.authRequest("PUT", url, authToken, body, authedHeaders()), this::handleAuthError)
+            () -> ApiClient.authRequest("PUT", url, authToken, body, authedHeaders(), this), this::handleAuthError)
         .thenApply(ApiClient.ApiResponse::jsonObject);
   }
 
@@ -302,7 +302,7 @@ public final class VaultController {
   private CompletableFuture<Map<String, Object>> fetchManifestAnswer() {
     String url = serviceUrl + "/api/auth/manifest";
     return Tasker.withReauth(
-            () -> ApiClient.authRequest("GET", url, authToken, null, authedHeaders()), this::handleAuthError)
+            () -> ApiClient.authRequest("GET", url, authToken, null, authedHeaders(), this), this::handleAuthError)
         .thenApply(
             resp -> {
               Map<String, Object> body = resp.ok() ? resp.jsonObject() : null;
@@ -464,7 +464,8 @@ public final class VaultController {
             "payloadHash", Helpers.base64(hash),
             "signature", Helpers.base64(CryptoPQ.sign(activeMember.dsaKeys.secretKey, hash)));
     // send() (not makeRequest) so the HTTP status survives for classification.
-    return ApiClient.send("POST", serviceUrl + "/api/auth/reauth", Helpers.utf8(Json.canonical(body)), Collections.emptyMap())
+    return ApiClient.send(
+            "POST", serviceUrl + "/api/auth/reauth", Helpers.utf8(Json.canonical(body)), Collections.emptyMap(), this)
         .<ReauthOutcome>thenApply(
             resp -> {
               Map<String, Object> parsed;
@@ -807,8 +808,8 @@ public final class VaultController {
 
   /**
    * The end of the collections this vault has handed out (see {@link CollectionController#dispose}):
-   * none of them saves or pulls again. The vault itself stays usable: whoever asks next gets
-   * collections loaded afresh.
+   * none of them saves or pulls again. After this alone the vault stays usable: whoever asks next
+   * gets collections loaded afresh. {@link Account#destroy} goes on to end the vault's requests.
    */
   public void disposeCollections() {
     List<CollectionController> ended;
@@ -850,7 +851,7 @@ public final class VaultController {
     if (authToken == null) throw new CodedException("Not authenticated", "NOT_AUTHENTICATED");
     String url = serviceUrl + path;
     return Tasker.withReauth(
-        () -> ApiClient.authRequest(method, url, authToken, body, authedHeaders()), this::handleAuthError);
+        () -> ApiClient.authRequest(method, url, authToken, body, authedHeaders(), this), this::handleAuthError);
   }
 
   private Map<String, Object> readManagerArea() {

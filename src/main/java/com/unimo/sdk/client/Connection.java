@@ -450,6 +450,7 @@ public final class Connection {
 
     @Override
     public void onOpen(WebSocket webSocket, Response response) {
+      if (webSocket != Connection.this.ws) return; // stale socket (replaced or stop()ed) — no-op
       connected = true;
       reauthStreak = 0; // a real open clears the reauth-loop streak
       opened = true;
